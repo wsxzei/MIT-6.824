@@ -18,14 +18,14 @@ package raft
 //
 
 import (
-//	"bytes"
+	"github.com/bytedance/sonic"
+	log "github.com/sirupsen/logrus"
+	//	"bytes"
 	"sync"
 	"sync/atomic"
-
-//	"6.824/labgob"
+	//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -37,7 +37,8 @@ import (
 // in part 2D you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
-//
+
+// ApplyMsg 当新的日志条目被提交后, 通过Make()入参applyCh, 将该结构体传递给服务(或测试程序)
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -48,6 +49,11 @@ type ApplyMsg struct {
 	Snapshot      []byte
 	SnapshotTerm  int
 	SnapshotIndex int
+}
+
+type LogEntry struct {
+	Term    int // 生成日志条目的任期
+	Command interface{}
 }
 
 //
@@ -64,16 +70,56 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	/* 持久化状态 */
+	currentTerm int  // 当前任期
+	votedFor    *int // 给 peers[] 中的哪个成员投票(设置成唯一ID)
+	log         []*LogEntry
+
+	/* 易失状态 */
+	status      NodeStateEnum
+	commitIdx   int // 本地已被提交的日志(初始值-1)
+	lastApplied int // 本地以及被应用到状态机的条目(初始值-1)
+
+	/* 仅Leader保存 */
+	nextIdx  []int // 成员下一条需要接收的日志条目索引(初始值 日志最新条目的索引值+1)
+	matchIdx []int // 成员与Leader同步的日志条目的最大索引
+
+	/* Goroutine 通讯 */
+	// 状态切换为 Follower, 通过该变量通知 ticker
+	toFollower *sync.Cond
+
+	// 用于重置 Follower 的选举超时计时器, 在 listenResetTimer 中被使用, channel 传输任期
+	// eg: Follower currentTerm=2, 出现如下事件之一, 向 resetTimer 发送任期 2
+	// 1. 收到当前或更高任期的 Leader 发送的 AppendEntries RPC
+	// 2. RequestVote RPC 投赞成票
+	resetSelectionTimer *BufferIntChan
+
+	// Candidate 监听 resetCandidate, 重置 candidate 状态
+	// 当收到新Leader的心跳 或 更高任期的RPC, 节点从 Candidate 切换为 Follower
+	// 向 resetCandidate 传递任期, 告知节点结束选举, 退出 rf.candidate Goroutine
+	// eg: Candidate currentTerm=2, 出现如下事件之一, 则传递任期2到channel
+	// 1. 收到任期 >=2 的 AppendEntries RPC
+	// 2. 收到任期 > 2 的 RequestVote RPC
+	resetCandidate *BufferIntChan
+
+	// 过期任期的Leader, 通过监听 resetLeader 获取重置 Leader 状态事件
+	// eg: Leader currentTerm = 2, 收到 RPC Term = 3, 切换为任期 3 的 follower
+	//  此时会发送 resetLeader 事件, 结束 rf.leader Goroutine
+	resetLeader *BufferIntChan
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
+// GetState return currentTerm and whether this server believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
-	var isleader bool
+	var isLeader bool
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isLeader = rf.status == NodeStateEnum_Leader
+	term = rf.currentTerm
+
 	// Your code here (2A).
-	return term, isleader
+	return term, isLeader
 }
 
 //
@@ -91,7 +137,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -115,7 +160,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -136,13 +180,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int // 若没有日志条目, 设置为 -1
+	LastLogTerm  int // 若没有日志条目, 设置为 -1
 }
 
 //
@@ -151,13 +198,81 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term  int  // 响应RPC的成员任期
+	Voted bool // 是否投票赞成
 }
 
-//
-// example RequestVote RPC handler.
-//
+// RequestVote RPC Handler
+// 比较最新一条日志的任期, 若投票发起者任期更新, 投赞成票
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	if args == nil || reply == nil {
+		log.WithFields(log.Fields{"method": "(*Raft).RequestVote"}).Panic("Invalid args or reply")
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	currentTerm := rf.currentTerm
+	currentStatus := rf.status
+
+	argStr, _ := sonic.MarshalString(args)
+	logCtx := log.WithFields(log.Fields{
+		"method":        "(*Raft)RequestVote",
+		"me":            rf.me,
+		"currentTerm":   currentTerm,
+		"currentStatus": currentStatus.String(),
+		"args":          argStr,
+	})
+	logCtx.Info("Handling RequestVote RPC")
+
+	var voteFor *int
+	reply.Term = currentTerm
+	reply.Voted = false
+
+	if args.Term < rf.currentTerm ||
+		(args.Term == rf.currentTerm && rf.status != NodeStateEnum_Follower) {
+		// args.Term 必须大于等于 currentTerm
+		// 若等于, 当前节点必须为 Follower, 否则不可能投赞成票
+		return
+	}
+
+	// 若当前任期 小于 请求发送者的任期, 执行如下操作：
+	// 1. 任期更新为args.Term, 切换为 Follower
+	// 2. 比较日志, 如果 RPC 发起者更新, 投下赞同票
+	if args.Term > currentTerm {
+		if rf.upToDate(args.LastLogIndex, args.LastLogTerm) {
+			// 发起者的日志最新, 投赞成票
+			voteFor = NewInt(args.CandidateId)
+		}
+		// 必须在锁保护的情况下, 调用 rf.follower
+		rf.follower(args.Term, voteFor)
+	}
+
+	if args.Term == currentTerm {
+		// rf.voteFor 为空或等于 candidateId, 且发起者的日志最新, 投赞成票
+		if IntPtrToVal(rf.votedFor, args.CandidateId) == args.CandidateId &&
+			rf.upToDate(args.LastLogIndex, args.LastLogTerm) {
+			voteFor = NewInt(args.CandidateId)
+			rf.votedFor = voteFor
+		}
+	}
+
+	if voteFor != nil {
+		logCtx.WithFields(log.Fields{"voteFor": *voteFor}).Info("Vote!")
+		reply.Voted = true
+		// 在本次 RequestVote 中投下赞成票, 重置 Follower 计时器, eventTerm 设置为 currentTerm
+		if currentStatus == NodeStateEnum_Follower {
+			go func() {
+				ok := rf.resetSelectionTimer.Send(currentTerm)
+				if !ok {
+					logCtx.Error("rf.resetSelectionTimer.Send failed")
+					return
+				}
+				logCtx.Info("Send reset timer message success")
+			}()
+		}
+	}
 }
 
 //
@@ -194,9 +309,87 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	Term         int // Leader 任期
+	LeaderId     int
+	PrevLogIdx   int         // 新日志前条目的索引
+	PrevLogTerm  int         // 该条目的任期
+	Entries      []*LogEntry // 新日志条目
+	LeaderCommit int         // Leader 节点最后一个提交条目的索引
+}
+
+type AppendEntriesReply struct {
+	Term    int  // 接收者任期
+	Success bool // 是否成功
+}
+
+// AppendEntries
+// 1. 如果Term小于currentTerm, 直接返回 false
+// 2. 如果 prevLogIndex, prevLogTerm 与 当前节点的日志不匹配, 返回 false
+// 3. 如果已经存在的日志条目 与 新的日志条目存在冲突, 删除当前节点冲突日志条目及之后的条目
+// 4. 复制当前日志中, 不存在的新日志条目
+// 5. commitIndex 设置为 min(LeaderCommit, 最后一个新日志条目的索引)
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args == nil || reply == nil {
+		log.WithFields(log.Fields{"method": "(*Raft)AppendEntries"}).Panic("invalid args or reply")
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	currentTerm := rf.currentTerm
+	currentStatus := rf.status
+
+	argStr, _ := sonic.MarshalString(args)
+	logCtx := log.WithFields(log.Fields{
+		"method":        "(*Raft)AppendEntries",
+		"currentTerm":   currentTerm,
+		"currentStatus": currentStatus.String(),
+		"args":          argStr,
+		"me":            rf.me,
+	})
+
+	reply.Term = currentTerm
+	reply.Success = false
+
+	// args.Term 小于 currentTerm, 直接返回 false
+	if currentTerm > args.Term {
+		return
+	}
+
+	reply.Success = true
+	if args.Term > currentTerm {
+		rf.follower(args.Term, nil)
+	}
+	if args.Term == currentTerm {
+		if currentStatus == NodeStateEnum_Candidate {
+			rf.follower(args.Term, rf.votedFor)
+		} else if currentStatus == NodeStateEnum_Leader {
+			logCtx.Panic("Multiple Leader in just one term")
+		}
+	}
+
+	// 心跳 RPC, 重置 Follower 计时器
+	if currentStatus == NodeStateEnum_Follower {
+		go func() {
+			ok := rf.resetSelectionTimer.Send(currentTerm)
+			if !ok {
+				logCtx.Error("rf.resetSelectionTimer.Send failed")
+				return
+			}
+			logCtx.Info("Send reset timer message success")
+		}()
+	}
+	return
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
-// the service using Raft (e.g. a k/v server) wants to start
+// Start the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
 // agreement and return immediately. there is no guarantee that this
@@ -216,7 +409,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
@@ -234,6 +426,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+
+	// 释放BufferChan
+	rf.resetSelectionTimer.Kill()
+	rf.resetCandidate.Kill()
+	rf.resetLeader.Kill()
 }
 
 func (rf *Raft) killed() bool {
@@ -241,29 +438,85 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
+// The ticker go routine starts a new election
+// if this peer hasn't received heartbeats recently.
+// 1. 若不为 Follower, 等待节点成为Follower
+// 2. 若为 Follower, 启动定时器, 超时则开启选举
+// 3. 若收到resetTimer的信号, 重置定时器
 func (rf *Raft) ticker() {
+
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 
+		// 获取任期和状态
+		rf.mu.Lock()
+		currentTerm := rf.currentTerm
+		status := rf.status
+
+		logCtx := log.WithFields(log.Fields{
+			"method":        "(*Raft).ticker",
+			"me":            rf.me,
+			"currentTerm":   currentTerm,
+			"currentStatus": status.String(),
+		})
+
+		switch status {
+		case NodeStateEnum_Follower:
+			// 在等待定时器超时前, 释放锁
+			rf.mu.Unlock()
+
+			timeout := make(chan struct{}, 1) // buffered channel, 防止goroutine泄漏
+
+			resetTimer := make(chan int)
+			// 设置为unbuffered, 在send exit返回后本轮loop listenResetSelectionTimer已经退出, 防止多协程消费rf.resetTimer
+			exit := make(chan struct{})
+
+			// 启动定时器 Goroutine
+			go startTimer(timeout, TimerScene_Selection)
+
+			// 启动 定时器重置事件 监听器
+			go rf.listenResetTimer(ResetTimerScene_SelectionTimer, resetTimer, exit, currentTerm)
+
+			select {
+			case <-timeout:
+				exit <- struct{}{}
+				// 采用同步的方式, 确保成员状态和任期的更新
+				// 若异步进行存在问题:
+				// 1. ticker 可能在 rf.candidate 前再次获取锁, 导致 ticker 计时器和 candidate 计时器同时启动
+				//   ticker 和 candidate 计时器同一时间只启动一个
+				logCtx.Info("Heartbeat timeout, begin a selection")
+				rf.candidate()
+			case eventTerm, _ := <-resetTimer:
+				logCtx.WithFields(log.Fields{"eventTerm": eventTerm}).Info("Reset heartbeat timer")
+				// 1. 响应RequestVote RPC, 并投赞成票
+				// 2. 接收到当前任期Leader的AppendEntries RPC
+			}
+		case NodeStateEnum_Leader, NodeStateEnum_Candidate:
+			// 等待切换为Follower
+			rf.toFollower.Wait()
+			logCtx.Info("Reacquire rf.mu, begin a new for-loop")
+			rf.mu.Unlock()
+		default:
+			rf.mu.Unlock()
+			logCtx.Panicf("Unkonwn rf.status")
+		}
 	}
 }
 
-//
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
+// Make the service or tester wants to create a Raft server.
+// 1. the ports of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
+// have the same order.
+// 2. persister is a place for this server to
 // save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
+// recent saved state, if any.
+// 3. applyCh is a channel on which the
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -272,13 +525,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.log = make([]*LogEntry, 0)
+	rf.status = NodeStateEnum_Follower
+	rf.commitIdx = -1
+	rf.lastApplied = -1
+
+	rf.resetSelectionTimer = NewBufferChan(make(chan int), make(chan int))
+	go rf.resetSelectionTimer.Run()
+	rf.resetCandidate = NewBufferChan(make(chan int), make(chan int))
+	go rf.resetCandidate.Run()
+	rf.resetLeader = NewBufferChan(make(chan int), make(chan int))
+	go rf.resetLeader.Run()
+
+	rf.toFollower = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
