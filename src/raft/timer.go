@@ -1,7 +1,7 @@
 package raft
 
 import (
-	log "github.com/sirupsen/logrus"
+	"log"
 	"time"
 )
 
@@ -21,15 +21,10 @@ func startTimer(timeChan chan struct{}, timerScene TimerScene) {
 }
 
 func (rf *Raft) listenResetTimer(scene ResetTimerScene, resetTimer chan int, exit chan struct{}, expectTerm int) {
-	logCtx := log.WithFields(log.Fields{
-		"method":          "(*Raft).listenResetTimer",
-		"me":              rf.me,
-		"expectTerm":      expectTerm,
-		"resetTimerScene": scene.String(),
-	})
+	DPrintf(dTimer, "S%v %v expectT%v, Start listening to reset timer event", []interface{}{rf.me, scene.String(), expectTerm})
 
 	if resetTimer == nil || exit == nil || expectTerm < 0 {
-		logCtx.Panicf("invalid params")
+		log.Panicf("S%v %v expectT%v, Invalid params", rf.me, scene.String(), expectTerm)
 	}
 
 	var rcvFrom *BufferIntChan
@@ -42,33 +37,34 @@ func (rf *Raft) listenResetTimer(scene ResetTimerScene, resetTimer chan int, exi
 		rcvFrom = rf.resetLeader
 	}
 	if rcvFrom == nil {
-		logCtx.Panic("Invalid ResetTimerScene")
+		log.Panicf("S%v %v expectT%v, Invalid ResetTimerScene", rf.me, scene.String(), expectTerm)
 	}
 
 	for !rf.killed() {
 		select {
 		case eventTerm, ok := <-rcvFrom.ReceiveAsync():
-			logCtx = logCtx.WithFields(log.Fields{"eventTerm": eventTerm})
 			if !ok {
-				logCtx.Error("BufferIntChan.out is closed")
+				DPrintf(dError, "S%v %v, expect T%v, event T%v, BufferIntChan.out is closed",
+					[]interface{}{rf.me, scene.String(), expectTerm, eventTerm})
 				return
 			}
+			DPrintf(dTimer, "S%v %v, expect T%v, event T%v", []interface{}{rf.me, scene.String(), expectTerm, eventTerm})
 			// 收到任期大于等于 expectTerm 时发送来的消息, 重置定时器
 			if eventTerm >= expectTerm {
 				select {
 				// 收到期望任期的重置定时器事件, 向ticker发送信号
 				case resetTimer <- eventTerm:
-					logCtx.Info("Reset Timer!")
+					DPrintf(dTimer, "S%v %v, expect T%v, event T%v, ResetTimer", []interface{}{rf.me, scene.String(), expectTerm, eventTerm})
 				case <-exit:
-					logCtx.Info("Goroutine exit")
+					DPrintf(dTimer, "S%v %v, expect T%v, event T%v, exit ResetTimer Listener",
+						[]interface{}{rf.me, scene.String(), expectTerm, eventTerm})
 				}
 				return
 			} else {
-				logCtx.Info("Skip out of date term")
 				continue
 			}
 		case <-exit:
-			logCtx.Info("Goroutine exit")
+			DPrintf(dTimer, "S%v %v, expect T%v, exit ResetTimer Listener", []interface{}{rf.me, scene.String(), expectTerm})
 			return
 		}
 	}

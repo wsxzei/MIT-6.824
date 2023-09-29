@@ -19,7 +19,7 @@ package raft
 
 import (
 	"github.com/bytedance/sonic"
-	log "github.com/sirupsen/logrus"
+	"log"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -56,9 +56,7 @@ type LogEntry struct {
 	Command interface{}
 }
 
-//
 // A Go object implementing a single Raft peer.
-//
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -122,11 +120,9 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isLeader
 }
 
-//
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-//
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -138,9 +134,7 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-//
 // restore previously persisted state.
-//
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -160,10 +154,8 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-//
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
-//
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
@@ -180,10 +172,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-//
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
-//
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int
@@ -192,10 +182,8 @@ type RequestVoteArgs struct {
 	LastLogTerm  int // 若没有日志条目, 设置为 -1
 }
 
-//
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
-//
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term  int  // 响应RPC的成员任期
@@ -207,7 +195,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	if args == nil || reply == nil {
-		log.WithFields(log.Fields{"method": "(*Raft).RequestVote"}).Panic("Invalid args or reply")
+		log.Panicf("RequestVote Handler, Invalid args or reply")
 	}
 
 	rf.mu.Lock()
@@ -217,14 +205,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	currentStatus := rf.status
 
 	argStr, _ := sonic.MarshalString(args)
-	logCtx := log.WithFields(log.Fields{
-		"method":        "(*Raft)RequestVote",
-		"me":            rf.me,
-		"currentTerm":   currentTerm,
-		"currentStatus": currentStatus.String(),
-		"args":          argStr,
-	})
-	logCtx.Info("Handling RequestVote RPC")
+	logArgs := []interface{}{rf.me, currentStatus.String(), currentTerm, argStr}
+	DPrintf(dVote, LogCommonFormat+", RequestVote Args=%v", logArgs)
 
 	var voteFor *int
 	reply.Term = currentTerm
@@ -259,23 +241,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if voteFor != nil {
-		logCtx.WithFields(log.Fields{"voteFor": *voteFor}).Info("Vote!")
+		logArgs = append(logArgs[:3], *voteFor)
+		DPrintf(dVote, LogCommonFormat+", Vote S%v!", logArgs)
 		reply.Voted = true
 		// 在本次 RequestVote 中投下赞成票, 重置 Follower 计时器, eventTerm 设置为 currentTerm
 		if currentStatus == NodeStateEnum_Follower {
 			go func() {
 				ok := rf.resetSelectionTimer.Send(currentTerm)
 				if !ok {
-					logCtx.Error("rf.resetSelectionTimer.Send failed")
+					DPrintf(dError, LogCommonFormat+", RequestVote Handler, rf.resetSelectionTimer.Send failed", logArgs[:3])
 					return
 				}
-				logCtx.Info("Send reset timer message success")
+				DPrintf(dHeartbeat, LogCommonFormat+", RequestVote Handler, rf.resetSelectionTimer.Send success", logArgs[:3])
 			}()
 		}
 	}
 }
 
-//
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -303,7 +285,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-//
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
@@ -331,7 +312,7 @@ type AppendEntriesReply struct {
 // 5. commitIndex 设置为 min(LeaderCommit, 最后一个新日志条目的索引)
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if args == nil || reply == nil {
-		log.WithFields(log.Fields{"method": "(*Raft)AppendEntries"}).Panic("invalid args or reply")
+		log.Panic("AppendEntries Handler, invalid args or reply")
 	}
 
 	rf.mu.Lock()
@@ -341,14 +322,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	currentStatus := rf.status
 
 	argStr, _ := sonic.MarshalString(args)
-	logCtx := log.WithFields(log.Fields{
-		"method":        "(*Raft)AppendEntries",
-		"currentTerm":   currentTerm,
-		"currentStatus": currentStatus.String(),
-		"args":          argStr,
-		"me":            rf.me,
-	})
+	logArgs := []interface{}{rf.me, currentStatus.String(), currentTerm, argStr}
 
+	DPrintf(dAppend, LogCommonFormat+", AppendEntries Args=%v", logArgs)
 	reply.Term = currentTerm
 	reply.Success = false
 
@@ -365,7 +341,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if currentStatus == NodeStateEnum_Candidate {
 			rf.follower(args.Term, rf.votedFor)
 		} else if currentStatus == NodeStateEnum_Leader {
-			logCtx.Panic("Multiple Leader in just one term")
+			log.Panicf(LogCommonFormat+", AppendEntries Handler, Multiple Leader in just one term", logArgs[:3]...)
 		}
 	}
 
@@ -374,10 +350,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		go func() {
 			ok := rf.resetSelectionTimer.Send(currentTerm)
 			if !ok {
-				logCtx.Error("rf.resetSelectionTimer.Send failed")
+				DPrintf(dError, LogCommonFormat+", AppendEntries Handler, rf.resetSelectionTimer.Send failed", logArgs[:3])
 				return
 			}
-			logCtx.Info("Send reset timer message success")
+			DPrintf(dHeartbeat, LogCommonFormat+", AppendEntries Handler, rf.resetSelectionTimer.Send success", logArgs[:3])
 		}()
 	}
 	return
@@ -388,7 +364,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-//
 // Start the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -401,7 +376,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-//
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -412,7 +386,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-//
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -422,7 +395,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // up CPU time, perhaps causing later tests to fail and generating
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
-//
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
@@ -456,12 +428,7 @@ func (rf *Raft) ticker() {
 		currentTerm := rf.currentTerm
 		status := rf.status
 
-		logCtx := log.WithFields(log.Fields{
-			"method":        "(*Raft).ticker",
-			"me":            rf.me,
-			"currentTerm":   currentTerm,
-			"currentStatus": status.String(),
-		})
+		logArgs := []interface{}{rf.me, status.String(), currentTerm}
 
 		switch status {
 		case NodeStateEnum_Follower:
@@ -487,21 +454,22 @@ func (rf *Raft) ticker() {
 				// 若异步进行存在问题:
 				// 1. ticker 可能在 rf.candidate 前再次获取锁, 导致 ticker 计时器和 candidate 计时器同时启动
 				//   ticker 和 candidate 计时器同一时间只启动一个
-				logCtx.Info("Heartbeat timeout, begin a selection")
+				DPrintf(dHeartbeat, LogCommonFormat+", Heartbeat timeout", logArgs)
 				rf.candidate()
 			case eventTerm, _ := <-resetTimer:
-				logCtx.WithFields(log.Fields{"eventTerm": eventTerm}).Info("Reset heartbeat timer")
+				logArgs = append(logArgs, eventTerm)
+				DPrintf(dHeartbeat, LogCommonFormat+", Reset heartbeat timer, eventT:%v", logArgs)
 				// 1. 响应RequestVote RPC, 并投赞成票
 				// 2. 接收到当前任期Leader的AppendEntries RPC
 			}
 		case NodeStateEnum_Leader, NodeStateEnum_Candidate:
 			// 等待切换为Follower
 			rf.toFollower.Wait()
-			logCtx.Info("Reacquire rf.mu, begin a new for-loop")
+			DPrintf(dInfo, LogCommonFormat+", ticker ToFollower Signal Received", logArgs)
 			rf.mu.Unlock()
 		default:
 			rf.mu.Unlock()
-			logCtx.Panicf("Unkonwn rf.status")
+			log.Panicf(LogCommonFormat+", ticker unkonwn rf.status", logArgs...)
 		}
 	}
 }

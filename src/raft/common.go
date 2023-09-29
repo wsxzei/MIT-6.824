@@ -40,6 +40,10 @@ const (
 	InitLogTerm  = -1
 )
 
+const (
+	LogCommonFormat = "S%v %v T%v"
+)
+
 // GetRandom 获取[lowerBound, upperBound]范围的随机数
 func GetRandom(lowerBound int, upperBound int) int {
 	if lowerBound > upperBound {

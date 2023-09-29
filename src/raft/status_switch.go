@@ -2,7 +2,7 @@ package raft
 
 import (
 	"github.com/bytedance/sonic"
-	log "github.com/sirupsen/logrus"
+	"log"
 )
 
 // candidate 开启一个选举
@@ -16,18 +16,13 @@ import (
 
 // candidate 是否快照任期作为入参？(应该不需要)
 // 存在任期改变, 但不需要重置定时器的情况
-// ReqeustVote 投赞成票, 重置Timer 和 切换Follower并发, 可能导致expectTerm小于当前任期
+// RequestVote 投赞成票, 重置Timer 和 切换Follower并发, 可能导致expectTerm小于当前任期
 func (rf *Raft) candidate() {
 	rf.mu.Lock()
 
-	logCtx := log.WithFields(log.Fields{
-		"method":     "(*Raft).candidate",
-		"me":         rf.me,
-		"prevTerm":   rf.currentTerm,
-		"prevStatus": rf.status,
-	})
+	logArgs := []interface{}{rf.me, rf.status.String(), rf.currentTerm}
+	DPrintf(dStatusSwitch, LogCommonFormat+", Switch To Candidate", logArgs)
 
-	logCtx.Info("Switch to Candidate")
 	var (
 		lastLogIdx  = len(rf.log) - 1
 		lastLogTerm = -1                            // 若没有日志条目, 设置为-1
@@ -39,6 +34,7 @@ func (rf *Raft) candidate() {
 	rf.currentTerm++
 	rf.votedFor = NewInt(rf.me)
 	voterSet[rf.me] = struct{}{}
+	logArgs[1] = NodeStateEnum_Candidate.String()
 
 	if lastLogIdx >= 0 {
 		lastLogTerm = rf.log[lastLogIdx].Term
@@ -77,44 +73,42 @@ func (rf *Raft) candidate() {
 		select {
 		case voter := <-voteCh:
 			// 收到赞成票
-			logCtx.WithFields(log.Fields{"voter": voter}).Info("Receive one upvote")
+			logArgs = append(logArgs[:3], voter)
+			DPrintf(dVote, LogCommonFormat+", Receive S%v vote", logArgs)
 			voterSet[voter] = struct{}{}
 		case <-timeout:
 			// 选举超时, 重新开启选举
-			logCtx.Warn("Selection timeout! Begin a new selection")
+			DPrintf(dSelection, LogCommonFormat+", Selection Timeout!", logArgs[:3])
 			exit <- struct{}{}
 			rf.candidate()
 			return
 		case eventTerm := <-resetCandidate:
-			logCtx.WithFields(log.Fields{"eventTerm": eventTerm}).Warn("Reset Candidate!")
+			logArgs = append(logArgs[:3], eventTerm)
+			DPrintf(dSelection, LogCommonFormat+", receive ResetCandidate, cancel Selection, event T%v", logArgs)
 			return
 		}
 	}
 
 	exit <- struct{}{}
-
-	logCtx.Info("Become Leader")
+	DPrintf(dSelection, LogCommonFormat+", win Selection!", logArgs[:3])
 	// 获取了集群中大多数节点的投票, 当选Leader
 	go rf.leader(voteReq.Term)
 }
 
 func (rf *Raft) requestVoteTask(server int, voteReq *RequestVoteArgs, voteCh chan<- int) {
 	reqStr, _ := sonic.MarshalString(voteReq)
-	logCtx := log.WithFields(log.Fields{
-		"method":  "(*Raft).requestVoteTask",
-		"server":  server,
-		"voteReq": reqStr,
-	})
+	DPrintf(dVote, "S%v send RequestVote to S%v, voteReq=%v", []interface{}{rf.me, server, reqStr})
 
 	voteResp := &RequestVoteReply{}
 	ok := rf.sendRequestVote(server, voteReq, voteResp)
 	if !ok {
-		logCtx.Error("RequestVote RPC failed")
+		DPrintf(dError, "S%v T%v, send RequestVote to S%v failed", []interface{}{rf.me, voteReq.Term, server})
 		return
 	}
 
 	respStr, _ := sonic.MarshalString(voteResp)
-	logCtx.WithFields(log.Fields{"voteResp": respStr}).Info("RequestVote RPC success")
+	DPrintf(dVote, "S%v T%v, receive RequestVote reply from S%v, reply=%v",
+		[]interface{}{rf.me, voteReq.Term, server, respStr})
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -144,30 +138,23 @@ func (rf *Raft) follower(targetTerm int, voteFor *int) {
 	currentTerm := rf.currentTerm
 	currentStatus := rf.status
 
-	logCtx := log.WithFields(log.Fields{
-		"method":     "(*Raft).follower",
-		"me":         rf.me,
-		"targetTerm": targetTerm,
-		"prevTerm":   currentTerm,
-		"prevStatus": currentStatus.String(),
-	})
+	logArgs := []interface{}{rf.me, currentStatus.String(), currentTerm, targetTerm, IntPtrToVal(voteFor, -1)}
+	DPrintf(dStatusSwitch, LogCommonFormat+", Switch To Follower, target T%v, voteFor S%v", logArgs)
 
 	if currentTerm > targetTerm {
 		// 忽略目标任期小于当前任期的状态切换
-		logCtx.Panic("Skip switch to Follower, targetTerm is less than currentTerm")
 		return
 	}
 
 	if currentTerm == targetTerm && currentStatus != NodeStateEnum_Candidate {
 		// 任期不变, 切换前状态必须为Candidate
-		logCtx.Warn("Skip switch to Follower, targetTerm equal to currentTerm")
 		return
 	}
 
-	logCtx.Info("Switch To follower")
 	rf.currentTerm = targetTerm
 	rf.status = NodeStateEnum_Follower
 	rf.votedFor = voteFor
+	logArgs[1] = NodeStateEnum_Follower.String()
 
 	switch currentStatus {
 	case NodeStateEnum_Leader:
@@ -175,25 +162,25 @@ func (rf *Raft) follower(targetTerm int, voteFor *int) {
 		go func() {
 			ok := rf.resetLeader.Send(currentTerm)
 			if !ok {
-				logCtx.Error("rf.resetLeader.Send failed")
+				DPrintf(dError, LogCommonFormat+", (*Raft).follower send ResetLeader failed", logArgs[:3])
 				return
 			}
-			logCtx.Info("Send reset leader message success")
+			DPrintf(dStatusSwitch, LogCommonFormat+", (*Raft).follower send ResetLeader success", logArgs[:3])
 		}()
 	case NodeStateEnum_Candidate:
 		// 正在执行选举, 通知 rf.listenResetCandidate, 终止选举过程
 		go func() {
 			ok := rf.resetCandidate.Send(currentTerm)
 			if !ok {
-				logCtx.Error("rf.resetCandidate.Send failed")
+				DPrintf(dError, LogCommonFormat+", (*Raft).follower send ResetCandidate failed", logArgs[:3])
 				return
 			}
-			logCtx.Info("Send reset candidate message success")
+			DPrintf(dStatusSwitch, LogCommonFormat+", (*Raft).follower send ResetCandidate success", logArgs[:3])
 		}()
 	case NodeStateEnum_Follower:
 		return
 	default:
-		logCtx.Panic("Invalid raft.status")
+		log.Panicf(LogCommonFormat+", (*Raft).follower Invalid status", logArgs[:3]...)
 	}
 
 	// 若节点由 Leader 或 Candidate 切换而来, 唤醒阻塞在 toFollower 上的 ticker Goroutine
@@ -206,17 +193,11 @@ func (rf *Raft) leader(expectTerm int) {
 	rf.mu.Lock()
 
 	currentTerm := rf.currentTerm
-
-	logCtx := log.WithFields(log.Fields{
-		"method":     "(*Raft).leader",
-		"me":         rf.me,
-		"expectTerm": expectTerm,
-		"prevTerm":   currentTerm,
-	})
+	logArgs := []interface{}{rf.me, rf.status.String(), currentTerm, expectTerm}
+	DPrintf(dStatusSwitch, LogCommonFormat+", Switch To Leader, expect T%v", logArgs)
 
 	if currentTerm != expectTerm {
 		rf.mu.Unlock()
-		logCtx.Warn("currentTerm not match expectTerm")
 		return
 	}
 
@@ -229,7 +210,7 @@ func (rf *Raft) leader(expectTerm int) {
 	}
 
 	rf.mu.Unlock()
-
+	logArgs[1] = NodeStateEnum_Leader.String()
 	// 每个 for-loop 依次进行如下工作:
 	// 1. 启动多个 Goroutine, 向所有成员发送心跳 RPC
 	// 2. 启动心跳超时计时器, 当计时器超时后, 结束当前 loop
@@ -255,9 +236,10 @@ func (rf *Raft) leader(expectTerm int) {
 		case <-timeout:
 			// 开始新的心跳周期
 			exit <- struct{}{}
-			logCtx.Info("Elapse a Heartbeat period, begin a new round of heartbeat rpc")
-		case eventTime := <-resetLeader:
-			logCtx.WithFields(log.Fields{"eventTime": eventTime}).Info("Reset Leader!")
+			DPrintf(dHeartbeat, LogCommonFormat+", Begin a new round of heartbeat rpc", logArgs[:3])
+		case eventTerm := <-resetLeader:
+			logArgs = append(logArgs[:3], eventTerm)
+			DPrintf(dStatusSwitch, LogCommonFormat+", (*Raft).leader receive ResetLeader, event T%v", logArgs)
 			return
 		}
 	}
@@ -266,13 +248,6 @@ func (rf *Raft) leader(expectTerm int) {
 // heartbeat 向成员 server 发送心跳
 // TODO 2B 实验补充日志相关内容
 func (rf *Raft) heartbeat(server int, argTerm int) {
-	logCtx := log.WithFields(log.Fields{
-		"method":  "(*Raft).heartbeat",
-		"server":  server,
-		"argTerm": argTerm,
-		"me":      rf.me,
-	})
-
 	args := &AppendEntriesArgs{
 		Term:         argTerm,
 		LeaderId:     rf.me,
@@ -281,29 +256,32 @@ func (rf *Raft) heartbeat(server int, argTerm int) {
 		Entries:      make([]*LogEntry, 0),
 		LeaderCommit: InitLogIndex,
 	}
-	reply := &AppendEntriesReply{}
+	argStr, _ := sonic.MarshalString(args)
+	DPrintf(dHeartbeat, "S%v send Heartbeat rpc to S%v, args=%v", []interface{}{rf.me, server, argStr})
 
+	reply := &AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, args, reply)
 	if !ok {
-		logCtx.Error("rf.sendAppendEntries failed")
+		DPrintf(dError, "S%v T%v, send Heartbeat to S%v failed", []interface{}{rf.me, argTerm, server})
 		return
 	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	replyStr, _ := sonic.MarshalString(reply)
 	currentTerm := rf.currentTerm
-	logCtx = logCtx.WithFields(log.Fields{"currentTerm": currentTerm, "replyStr": replyStr})
+	DPrintf(dHeartbeat, "S%v T%v, receive Heartbeat reply from S%v, replyStr=%v",
+		[]interface{}{rf.me, currentTerm, server, replyStr})
+
 	if reply.Term > currentTerm {
 		// 当前节点为过去任期, 切换为 Follower, 更新任期
-		logCtx.Info("currentTerm less than reply.Term, rf.follower")
 		rf.follower(reply.Term, nil)
 		return
 	}
 
 	if currentTerm != argTerm {
 		// 当前任期不等于发出请求时的任期, 不请求响应结果
-		logCtx.Info("currentTerm isn't equal to argTerm, return")
 		return
 	}
 	// TODO

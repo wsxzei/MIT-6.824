@@ -1,25 +1,56 @@
 package raft
 
 import (
-	log "github.com/sirupsen/logrus"
+	"log"
 	"os"
+	"strconv"
+	"time"
 )
 
-func init() {
-	// Log as JSON instead of the default ASCII formatter.
-	//log.SetFormatter(&log.JSONFormatter{})
-	log.SetFormatter(&log.TextFormatter{
-		TimestampFormat: "2006-01-02T15:04:05.999ms",
-	})
-	//file, err := os.OpenFile(fmt.Sprintf("./debug/raft_%v.log", time.Now().UnixMilli()), os.O_CREATE|os.O_APPEND|os.O_WRONLY,
-	//	0777)
-	//if err != nil {
-	//	fmt.Printf("log init failed, os.OpenFile err=%v", err)
-	//	panic("log init")
-	//}
-	//_, _ = fmt.Fprintf(file, "\n\n")
+type logTopic string
 
-	// Output to stdout instead of the default stderr
-	// Can be any io.Writer, see below for File example
-	log.SetOutput(os.Stdout)
+const (
+	dClient       logTopic = "CLNT"
+	dCommit       logTopic = "CMIT"
+	dDrop         logTopic = "DROP"
+	dError        logTopic = "ERRO"
+	dInfo         logTopic = "INFO"
+	dLeader       logTopic = "LEAD"
+	dLog          logTopic = "LOG1"
+	dLog2         logTopic = "LOG2"
+	dPersist      logTopic = "PERS"
+	dSnap         logTopic = "SNAP"
+	dTerm         logTopic = "TERM"
+	dTest         logTopic = "TEST"
+	dTimer        logTopic = "TIMR"
+	dHeartbeat    logTopic = "Heartbeat"
+	dAppend       logTopic = "Append"
+	dTrace        logTopic = "TRCE"
+	dVote         logTopic = "VOTE"
+	dWarn         logTopic = "WARN"
+	dStatusSwitch logTopic = "StatusSwitch"
+	dSelection    logTopic = "Selection"
+)
+
+var debugStart time.Time
+var debugVerbosity int
+
+func init() {
+	debugVerbosity = getVerbosity()
+	debugStart = time.Now()
+
+	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime)) // 不使用log默认的日期和时间输出
+}
+
+func getVerbosity() int {
+	v := os.Getenv("VERBOSE")
+	level := 0
+	if v != "" {
+		var err error
+		level, err = strconv.Atoi(v)
+		if err != nil {
+			log.Fatalf("Invalid verbosity %v", v)
+		}
+	}
+	return level
 }
