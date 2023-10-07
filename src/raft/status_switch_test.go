@@ -19,15 +19,16 @@ func TestCandidate(t *testing.T) {
 			peers: []*labrpc.ClientEnd{
 				{}, {}, {}, {}, {},
 			}, // 5 个成员, 1 和 3 投赞成票, 2 和 4 反对
+			log:                 []*LogEntry{{}},
 			currentTerm:         0,
 			status:              NodeStateEnum_Follower,
 			resetSelectionTimer: NewBufferChan(make(chan int), make(chan int)),
-			resetLeader:         NewBufferChan(make(chan int), make(chan int)),
 			resetCandidate:      NewBufferChan(make(chan int), make(chan int)),
 		}
 		go rf.resetSelectionTimer.Run()
 		go rf.resetCandidate.Run()
-		go rf.resetLeader.Run()
+		rf.toFollower = sync.NewCond(&rf.mu)
+		rf.logCommit = sync.NewCond(&rf.mu)
 
 		PatchConvey("测试选举成功", func() {
 			Mock((*Raft).sendRequestVote).To(func(rf *Raft, server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -46,7 +47,7 @@ func TestCandidate(t *testing.T) {
 				defer rf.mu.Unlock()
 				rf.status = NodeStateEnum_Leader
 			}).Build()
-			rf.candidate()
+			rf.candidate(0)
 
 			time.Sleep(10 * time.Millisecond)
 
@@ -77,7 +78,7 @@ func TestCandidate(t *testing.T) {
 				rf.status = NodeStateEnum_Leader
 			}).Build()
 
-			rf.candidate()
+			rf.candidate(0)
 
 			time.Sleep(2 * time.Millisecond)
 
@@ -106,7 +107,7 @@ func TestCandidate(t *testing.T) {
 				time.Sleep(1 * time.Second) // 最多超时 2 次, 任期达到 3
 				rf.resetCandidate.Send(3)
 			}()
-			rf.candidate()
+			rf.candidate(0)
 
 			time.Sleep(2 * time.Millisecond)
 
@@ -128,12 +129,10 @@ func TestFollower(t *testing.T) {
 			currentTerm:         1,
 			status:              NodeStateEnum_Candidate,
 			resetSelectionTimer: NewBufferChan(make(chan int), make(chan int)),
-			resetLeader:         NewBufferChan(make(chan int), make(chan int)),
 			resetCandidate:      NewBufferChan(make(chan int), make(chan int)),
 		}
 		go rf.resetSelectionTimer.Run()
 		go rf.resetCandidate.Run()
-		go rf.resetLeader.Run()
 
 		PatchConvey("Candidate To Follower", func() {
 			i := int32(0)
@@ -174,18 +173,19 @@ func TestLeader(t *testing.T) {
 			peers: []*labrpc.ClientEnd{
 				{}, {}, {},
 			},
-			currentTerm:         1,
-			status:              NodeStateEnum_Candidate,
 			resetSelectionTimer: NewBufferChan(make(chan int), make(chan int)),
-			resetLeader:         NewBufferChan(make(chan int), make(chan int)),
 			resetCandidate:      NewBufferChan(make(chan int), make(chan int)),
 		}
+		rf.toFollower = sync.NewCond(&rf.mu)
+		rf.logCommit = sync.NewCond(&rf.mu)
 		go rf.resetSelectionTimer.Run()
 		go rf.resetCandidate.Run()
-		go rf.resetLeader.Run()
 
 		PatchConvey("测试Leader收到更高任期的响应, 重新切换为Follower", func() {
+			rf.currentTerm = 1
+			rf.status = NodeStateEnum_Candidate
 			rf.toFollower = sync.NewCond(&rf.mu)
+			rf.log = []*LogEntry{{}}
 			Mock((*Raft).sendAppendEntries).To(func(rf *Raft, server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 				reply.Term = 2
 				return true
@@ -200,32 +200,59 @@ func TestLeader(t *testing.T) {
 			rf.Kill()
 		})
 
-		PatchConvey("测试心跳RPC次数", func() {
-			// 测试一段时间内, heartbeat 方法调用的次数
-			sleepTime := time.Second
-			cnt := int32(0)
+		PatchConvey("", func() {
+			rf.currentTerm = 3
+			rf.commitIdx = 0
+			rf.matchIdx = make([]int, 3)
 
-			Mock((*Raft).heartbeat).To(func(rf *Raft, server int, argTerm int) {
-				if server == 1 {
-					atomic.AddInt32(&cnt, 1)
+			Mock((*Raft).logSyncer).Return().Build()
+
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				rf.mu.Lock()
+				rf.log = []*LogEntry{{}, {Term: 1}}
+				rf.matchIdx = []int{1, 0, 1} // 不能提交过去任期 1 的日志
+				rf.mu.Unlock()
+
+				time.Sleep(100 * time.Millisecond)
+				rf.mu.Lock()
+				rf.log = append(rf.log, &LogEntry{Term: 2}, &LogEntry{Term: 3})
+				rf.matchIdx = []int{3, 1, 2} // 不能提交过去任期 2 的日志
+				rf.mu.Unlock()
+
+				time.Sleep(500 * time.Millisecond)
+				rf.mu.Lock()
+				rf.log = append(rf.log, &LogEntry{Term: 3}, &LogEntry{Term: 3})
+				rf.matchIdx = []int{5, 4, 3} // commitIdx = 4, 可提交当前任期 3 的日志
+				rf.mu.Unlock()
+			}()
+
+			broadcastCnt := int32(0)
+			go func() {
+				for rf.killed() == false {
+					rf.mu.Lock()
+					rf.logCommit.Wait()
+					broadcastCnt++
+					rf.mu.Unlock()
 				}
-			}).Build()
+			}()
 
-			go rf.leader(1)
+			time.Sleep(10 * time.Millisecond)
+			go rf.leader(3)
 
-			time.Sleep(sleepTime)
-			rf.resetLeader.Send(1)
-
+			// 检测: 不应该提交过去任期的日志
+			time.Sleep(250 * time.Millisecond)
 			rf.mu.Lock()
-			defer rf.mu.Unlock()
+			So(rf.commitIdx, ShouldEqual, 0)
+			rf.mu.Unlock()
 
-			So(rf.currentTerm, ShouldEqual, 1)
-			So(rf.status, ShouldEqual, NodeStateEnum_Leader)
-			// 1000 / 150 = 6, 总共会有 7 轮心跳
-			So(cnt, ShouldEqual, time.Second/HeartbeatPeriod+1)
+			time.Sleep(1 * time.Second)
+			rf.mu.Lock()
+			So(broadcastCnt, ShouldEqual, 1) // 仅提交一次日志
+			So(rf.commitIdx, ShouldEqual, 4)
+			rf.mu.Unlock()
 
 			rf.Kill()
 		})
-
 	})
 }

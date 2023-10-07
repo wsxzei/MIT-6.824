@@ -42,7 +42,7 @@ import (
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
-	CommandIndex int
+	CommandIndex int // 注意: CommandIndex 起始为 1
 
 	// For 2D:
 	SnapshotValid bool
@@ -63,20 +63,23 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
 	/* 持久化状态 */
-	currentTerm int  // 当前任期
-	votedFor    *int // 给 peers[] 中的哪个成员投票(设置成唯一ID)
-	log         []*LogEntry
+	currentTerm  int  // 当前任期
+	votedFor     *int // 给 peers[] 中的哪个成员投票(设置成唯一ID)
+	log          []*LogEntry
+	snapshotIdx  int // 快照中最后一个条目的索引
+	snapshotTerm int // 快照中最后一个条目的任期
 
 	/* 易失状态 */
 	status      NodeStateEnum
-	commitIdx   int // 本地已被提交的日志(初始值-1)
-	lastApplied int // 本地以及被应用到状态机的条目(初始值-1)
+	commitIdx   int // 本地已被提交的日志(初始值0)
+	lastApplied int // 本地以及被应用到状态机的条目(初始值0)
 
 	/* 仅Leader保存 */
 	nextIdx  []int // 成员下一条需要接收的日志条目索引(初始值 日志最新条目的索引值+1)
@@ -85,6 +88,9 @@ type Raft struct {
 	/* Goroutine 通讯 */
 	// 状态切换为 Follower, 通过该变量通知 ticker
 	toFollower *sync.Cond
+
+	// 新的日志被提交, 发送 ApplyMsg
+	logCommit *sync.Cond
 
 	// 用于重置 Follower 的选举超时计时器, 在 listenResetTimer 中被使用, channel 传输任期
 	// eg: Follower currentTerm=2, 出现如下事件之一, 向 resetTimer 发送任期 2
@@ -99,11 +105,6 @@ type Raft struct {
 	// 1. 收到任期 >=2 的 AppendEntries RPC
 	// 2. 收到任期 > 2 的 RequestVote RPC
 	resetCandidate *BufferIntChan
-
-	// 过期任期的Leader, 通过监听 resetLeader 获取重置 Leader 状态事件
-	// eg: Leader currentTerm = 2, 收到 RPC Term = 3, 切换为任期 3 的 follower
-	//  此时会发送 resetLeader 事件, 结束 rf.leader Goroutine
-	resetLeader *BufferIntChan
 }
 
 // GetState return currentTerm and whether this server believes it is the leader.
@@ -300,16 +301,21 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int  // 接收者任期
-	Success bool // 是否成功
+	Term         int  // 接收者任期
+	Success      bool // 是否成功
+	ConflictTerm *int
+	ConflictIdx  int // 冲突日志的索引
 }
 
 // AppendEntries
-// 1. 如果Term小于currentTerm, 直接返回 false
-// 2. 如果 prevLogIndex, prevLogTerm 与 当前节点的日志不匹配, 返回 false
-// 3. 如果已经存在的日志条目 与 新的日志条目存在冲突, 删除当前节点冲突日志条目及之后的条目
-// 4. 复制当前日志中, 不存在的新日志条目
-// 5. commitIndex 设置为 min(LeaderCommit, 最后一个新日志条目的索引)
+//  1. 如果Term小于currentTerm, 直接返回 false;
+//     1.1 更新当前任期和状态 , 执行一致性检查
+//  2. 如果 prevLogIndex, prevLogTerm 与 当前节点的日志不匹配, 返回 false
+//     2.1 如果不存在冲突的日志条目, conflictTerm 设置为 nil, conflictIdx 为最新日志条目的索引
+//     2.2 如果存在冲突条目, conflictTerm 为冲突条目的任期, conflictIdx 为任期 conflictTerm 的第一个日志条目
+//  3. 如果已经存在的日志条目 与 新的日志条目存在冲突, 删除本地日志中冲突索引及之后的条目
+//  4. 复制当前日志中, 不存在的新日志条目
+//  5. commitIndex 设置为 min(LeaderCommit, 最后一个新日志条目的索引)
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if args == nil || reply == nil {
 		log.Panic("AppendEntries Handler, invalid args or reply")
@@ -333,10 +339,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	reply.Success = true
 	if args.Term > currentTerm {
-		rf.follower(args.Term, nil)
+		rf.follower(args.Term, NewInt(args.LeaderId))
 	}
+
 	if args.Term == currentTerm {
 		if currentStatus == NodeStateEnum_Candidate {
 			rf.follower(args.Term, rf.votedFor)
@@ -356,6 +362,70 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			DPrintf(dHeartbeat, LogCommonFormat+", AppendEntries Handler, rf.resetSelectionTimer.Send success", logArgs[:3])
 		}()
 	}
+
+	curLastLogIndex := rf.getGlobalIndex(len(rf.log) - 1)
+	if curLastLogIndex < args.PrevLogIdx {
+		reply.ConflictIdx = curLastLogIndex
+		replyStr, _ := sonic.MarshalString(reply)
+		DPrintf(dAppend, LogCommonFormat+", AppendEntries Handler, reply=%v",
+			[]interface{}{rf.me, currentStatus.String(), rf.currentTerm, replyStr})
+		return
+	}
+
+	localPrevLogIdx := rf.getLocalIndex(args.PrevLogIdx)
+	localPrevLogTerm := rf.log[localPrevLogIdx].Term
+	if localPrevLogTerm != args.PrevLogTerm {
+		conflictIdx := localPrevLogIdx
+		for idx := localPrevLogIdx; idx > 0; idx-- {
+			if rf.log[idx-1].Term == localPrevLogTerm {
+				conflictIdx = idx - 1
+			} else {
+				break
+			}
+		}
+		reply.ConflictIdx = rf.getGlobalIndex(conflictIdx)
+		reply.ConflictTerm = NewInt(localPrevLogTerm)
+
+		replyStr, _ := sonic.MarshalString(reply)
+		DPrintf(dAppend, LogCommonFormat+", AppendEntries Handler, reply=%v",
+			[]interface{}{rf.me, currentStatus.String(), rf.currentTerm, replyStr})
+		return
+	}
+
+	// 通过一致性检查, 更新本地日志
+	reply.Success = true
+	conflictIdx := (*int)(nil)       // 第一个冲突条目的索引
+	appendBegin := len(args.Entries) // args.Entries 中索引最小的新条目
+	for i, entry := range args.Entries {
+		logIdx := localPrevLogIdx + 1 + i
+		if logIdx < len(rf.log) && rf.log[logIdx].Term != entry.Term {
+			conflictIdx = NewInt(logIdx)
+			appendBegin = i
+			break
+		}
+	}
+
+	suffixLength := len(rf.log) - 1 - localPrevLogIdx
+	if conflictIdx != nil {
+		// 从 conflictIdx 开始, 删除本地日志条目
+		rf.deleteEntryFrom(*conflictIdx)
+	} else if suffixLength < len(args.Entries) {
+		appendBegin = suffixLength
+	}
+
+	for i := appendBegin; i < len(args.Entries); i++ {
+		rf.log = append(rf.log, args.Entries[i])
+	}
+
+	// 更新 commitIdx, 通知 applier 应用新日志到状态机
+	commitIdx := MinInt(args.LeaderCommit, args.PrevLogIdx+len(args.Entries))
+	if commitIdx > rf.commitIdx {
+		DPrintf(dCommit, LogCommonFormat+", commitIdx %v->%v",
+			[]interface{}{rf.me, currentStatus.String(), rf.currentTerm, rf.commitIdx, commitIdx})
+		rf.commitIdx = commitIdx
+		rf.logCommit.Broadcast()
+	}
+
 	return
 }
 
@@ -376,14 +446,35 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
+	index = -1
+	term = -1
+	isLeader = true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.status != NodeStateEnum_Leader {
+		isLeader = false
+		return
+	}
+
+	// 新增日志条目, logSyncer 每隔 15ms 检查是否有新增条目, 若有则发起 AppendEntries RPC
+	term = rf.currentTerm
+	index = rf.getGlobalIndex(len(rf.log))
+	entry := &LogEntry{
+		Term:    term,
+		Command: command,
+	}
+	rf.log = append(rf.log, entry)
+	rf.matchIdx[rf.me] = index
+	rf.nextIdx[rf.me] = index + 1
+
+	DPrintf(dLog, LogCommonFormat+", submit a new entry(index %v), command=%v",
+		[]interface{}{rf.me, rf.status.String(), term, index, command})
+
+	return
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -399,10 +490,13 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 
+	// 退出ticker, applier Goroutine
+	rf.toFollower.Broadcast()
+	rf.logCommit.Broadcast()
+
 	// 释放BufferChan
 	rf.resetSelectionTimer.Kill()
 	rf.resetCandidate.Kill()
-	rf.resetLeader.Kill()
 }
 
 func (rf *Raft) killed() bool {
@@ -455,7 +549,7 @@ func (rf *Raft) ticker() {
 				// 1. ticker 可能在 rf.candidate 前再次获取锁, 导致 ticker 计时器和 candidate 计时器同时启动
 				//   ticker 和 candidate 计时器同一时间只启动一个
 				DPrintf(dHeartbeat, LogCommonFormat+", Heartbeat timeout", logArgs)
-				rf.candidate()
+				rf.candidate(currentTerm)
 			case eventTerm, _ := <-resetTimer:
 				logArgs = append(logArgs, eventTerm)
 				DPrintf(dHeartbeat, LogCommonFormat+", Reset heartbeat timer, eventT:%v", logArgs)
@@ -491,24 +585,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.log = make([]*LogEntry, 0)
+	rf.log = []*LogEntry{{}} // 日志的索引 0 处的日志条目为 dummyEntry (见 config.go applier 和 applierSnap)
 	rf.status = NodeStateEnum_Follower
-	rf.commitIdx = -1
-	rf.lastApplied = -1
+	rf.commitIdx = InitLogIndex
+	rf.lastApplied = InitLogIndex
 
 	rf.resetSelectionTimer = NewBufferChan(make(chan int), make(chan int))
 	go rf.resetSelectionTimer.Run()
 	rf.resetCandidate = NewBufferChan(make(chan int), make(chan int))
 	go rf.resetCandidate.Run()
-	rf.resetLeader = NewBufferChan(make(chan int), make(chan int))
-	go rf.resetLeader.Run()
 
 	rf.toFollower = sync.NewCond(&rf.mu)
+	rf.logCommit = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// 启动 applier Goroutine, 将提交的日志条目应用到状态机
+	go rf.applier()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

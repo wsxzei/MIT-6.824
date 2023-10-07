@@ -69,6 +69,7 @@ func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
 	cfg.t = t
+	// 启动网络, 接收rpc请求, dispatch给指定服务器, 并返回响应
 	cfg.net = labrpc.MakeNetwork()
 	cfg.n = n
 	cfg.applyErr = make([]string, cfg.n)
@@ -80,7 +81,7 @@ func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
 	cfg.start = time.Now()
 
 	cfg.setunreliable(unreliable)
-
+	// 如果网络断开连接, 可能导致发送 RPC 的routine 长时间阻塞, 见(*Network).processReq方法
 	cfg.net.LongDelays(true)
 
 	applier := cfg.applier
@@ -137,6 +138,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 	err_msg := ""
 	v := m.Command
 	for j := 0; j < len(cfg.logs); j++ {
+		// 若集群中其他成员在 CommandIndex 索引处已经提交了与 m.Command 不同的命令, 抛出错误
 		if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
 			log.Printf("%v: log %v; server %v\n", i, cfg.logs[i], cfg.logs[j])
 			// some server has already committed a different value for this entry!
@@ -144,6 +146,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 				m.CommandIndex, i, m.Command, j, old)
 		}
 	}
+	// 检查 Si m.CommandIndex 的前驱条目是否被提交
 	_, prevok := cfg.logs[i][m.CommandIndex-1]
 	cfg.logs[i][m.CommandIndex] = v
 	if m.CommandIndex > cfg.maxIndex {
@@ -184,6 +187,9 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 		if m.SnapshotValid {
 			//DPrintf("Installsnapshot %v %v\n", m.SnapshotIndex, lastApplied)
 			cfg.mu.Lock()
+			// InstallSnapshot Handler 通过 applyCh 传递 Snapshot
+			// 服务从 applyCh 中读取出快照后, 使用 CondInstallSnapshot 通知 Raft, 服务正在切换为传递来的Snapshot
+			// Raft 应该同时更新它的日志, 若是旧的快照, CondInstallSnapshot 返回 false
 			if cfg.rafts[i].CondInstallSnapshot(m.SnapshotTerm,
 				m.SnapshotIndex, m.Snapshot) {
 				cfg.logs[i] = make(map[int]interface{})
@@ -193,6 +199,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 				if d.Decode(&v) != nil {
 					log.Fatalf("decode error\n")
 				}
+				// 注意: 应用快照, 不需要使用 checkLogs 校验之前索引是否被应用
 				cfg.logs[i][m.SnapshotIndex] = v
 				lastApplied = m.SnapshotIndex
 			}
@@ -200,6 +207,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 		} else if m.CommandValid && m.CommandIndex > lastApplied {
 			//DPrintf("apply %v lastApplied %v\n", m.CommandIndex, lastApplied)
 			cfg.mu.Lock()
+			// 更新 cfg.logs, 检查其他成员在 m.CommandIndex 位置的命令是否与 m.Command 相同
 			err_msg, prevok := cfg.checkLogs(i, m)
 			cfg.mu.Unlock()
 			if m.CommandIndex > 1 && prevok == false {
@@ -212,11 +220,13 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 				// holding locks...
 			}
 			lastApplied = m.CommandIndex
+			// 每 SnapshotInterval 个命令被提交, 生成一次快照
 			if (m.CommandIndex+1)%SnapShotInterval == 0 {
 				w := new(bytes.Buffer)
 				e := labgob.NewEncoder(w)
 				v := m.Command
 				e.Encode(v)
+				// 测试使用的状态机仅仅维护一个整数, 因此快照由 int 序列化而来
 				cfg.rafts[i].Snapshot(m.CommandIndex, w.Bytes())
 			}
 		} else {
@@ -230,13 +240,11 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 	}
 }
 
-//
 // start or re-start a Raft.
 // if one already exists, "kill" it first.
 // allocate new outgoing port file names, and a new
 // state persister, to isolate previous instance of
 // this server. since we cannot really kill it.
-//
 func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	cfg.crash1(i)
 
@@ -442,6 +450,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		cmd1, ok := cfg.logs[i][index]
 		cfg.mu.Unlock()
 
+		// 检测 raft 集群成员若在 index 位置的日志条目已经提交, 该条目包含的命令是否相同
 		if ok {
 			if count > 0 && cmd != cmd1 {
 				cfg.t.Fatalf("committed values do not match: index %v, %v, %v\n",
@@ -457,6 +466,9 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 // wait for at least n servers to commit.
 // but don't wait forever.
 func (cfg *config) wait(index int, n int, startTerm int) interface{} {
+	// 检查: 至少 n 个节点 index 索引处的条目已提交
+	// 若已提交的节点数量小于 n, 所有节点的任期不应该大于 startTerm
+	// 因为一旦存在节点任期大于 startTerm, startTerm 提交的日志条目旧不能保证被提交
 	to := 10 * time.Millisecond
 	for iters := 0; iters < 30; iters++ {
 		nd, _ := cfg.nCommitted(index)
@@ -512,6 +524,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			}
 			cfg.mu.Unlock()
 			if rf != nil {
+				// 发送命令, 第一个返回值: 如果cmd被提交, 对应的日志条目索引
 				index1, _, ok := rf.Start(cmd)
 				if ok {
 					index = index1
@@ -525,6 +538,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
+				// 检查 raft 成员在 index 索引处提交的命令 cmd1, nd 为提交该命令的成员数
 				nd, cmd1 := cfg.nCommitted(index)
 				if nd > 0 && nd >= expectedServers {
 					// committed

@@ -17,15 +17,26 @@ import (
 // candidate 是否快照任期作为入参？(应该不需要)
 // 存在任期改变, 但不需要重置定时器的情况
 // RequestVote 投赞成票, 重置Timer 和 切换Follower并发, 可能导致expectTerm小于当前任期
-func (rf *Raft) candidate() {
+func (rf *Raft) candidate(expectTerm int) {
 	rf.mu.Lock()
 
 	logArgs := []interface{}{rf.me, rf.status.String(), rf.currentTerm}
 	DPrintf(dStatusSwitch, LogCommonFormat+", Switch To Candidate", logArgs)
 
+	// 当前任期与 expectTerm 不匹配, 有两种情况不能继续选举:
+	// 1. 当前任期, 节点通过 RequestVote Handler 进行了投票
+	// 2. 收到大于 expectTerm 任期的 Leader 心跳, votedFor 设置为 LeaderId
+	// 注: resetCandidate 和 resetSelectionTimer 重置计时器存在延迟, 需要额外校验
+	if rf.currentTerm != expectTerm && rf.votedFor != nil {
+		rf.mu.Unlock()
+		logArgs = append(logArgs, expectTerm, rf.votedFor)
+		DPrintf(dStatusSwitch, LogCommonFormat+" quit candidate, (expectTerm %v, votedFor %v) not matched", logArgs)
+		return
+	}
+
 	var (
-		lastLogIdx  = len(rf.log) - 1
-		lastLogTerm = -1                            // 若没有日志条目, 设置为-1
+		lastLogIdx  = rf.getGlobalIndex(len(rf.log) - 1)
+		lastLogTerm = rf.log[len(rf.log)-1].Term    // 若没有日志条目, 设置为-1
 		voteCh      = make(chan int, len(rf.peers)) // RequestVote Handler协程传递收到的赞成票
 		voterSet    = make(map[int]struct{})        // 用于统计投票数, 具有去重的作用
 	)
@@ -34,11 +45,7 @@ func (rf *Raft) candidate() {
 	rf.currentTerm++
 	rf.votedFor = NewInt(rf.me)
 	voterSet[rf.me] = struct{}{}
-	logArgs[1] = NodeStateEnum_Candidate.String()
-
-	if lastLogIdx >= 0 {
-		lastLogTerm = rf.log[lastLogIdx].Term
-	}
+	logArgs = []interface{}{rf.me, rf.status.String(), rf.currentTerm}
 
 	voteReq := &RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -80,7 +87,7 @@ func (rf *Raft) candidate() {
 			// 选举超时, 重新开启选举
 			DPrintf(dSelection, LogCommonFormat+", Selection Timeout!", logArgs[:3])
 			exit <- struct{}{}
-			rf.candidate()
+			rf.candidate(voteReq.Term)
 			return
 		case eventTerm := <-resetCandidate:
 			logArgs = append(logArgs[:3], eventTerm)
@@ -158,15 +165,7 @@ func (rf *Raft) follower(targetTerm int, voteFor *int) {
 
 	switch currentStatus {
 	case NodeStateEnum_Leader:
-		// 结束rf.leader Goroutine
-		go func() {
-			ok := rf.resetLeader.Send(currentTerm)
-			if !ok {
-				DPrintf(dError, LogCommonFormat+", (*Raft).follower send ResetLeader failed", logArgs[:3])
-				return
-			}
-			DPrintf(dStatusSwitch, LogCommonFormat+", (*Raft).follower send ResetLeader success", logArgs[:3])
-		}()
+		// do nothing
 	case NodeStateEnum_Candidate:
 		// 正在执行选举, 通知 rf.listenResetCandidate, 终止选举过程
 		go func() {
@@ -205,84 +204,53 @@ func (rf *Raft) leader(expectTerm int) {
 	rf.status = NodeStateEnum_Leader
 	rf.nextIdx = make([]int, len(rf.peers))
 	rf.matchIdx = make([]int, len(rf.peers))
-	for i, _ := range rf.matchIdx {
-		rf.matchIdx[i] = -1
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			rf.matchIdx[i] = rf.getGlobalIndex(len(rf.log) - 1)
+		} else {
+			rf.matchIdx[i] = InitLogIndex
+		}
+		rf.nextIdx[i] = rf.getGlobalIndex(len(rf.log))
 	}
 
 	rf.mu.Unlock()
 	logArgs[1] = NodeStateEnum_Leader.String()
-	// 每个 for-loop 依次进行如下工作:
-	// 1. 启动多个 Goroutine, 向所有成员发送心跳 RPC
-	// 2. 启动心跳超时计时器, 当计时器超时后, 结束当前 loop
-	// 3. 在监听定时器超时的同时, 监听 resetLeader channel
-	// 	resetLeader 事件由 rf.follower发出, 用于结束 rf.leader Goroutine
-	for !rf.killed() {
-		for server, _ := range rf.peers {
-			if server == rf.me {
-				continue
-			}
-			go rf.heartbeat(server, currentTerm)
+
+	// Leader 为每个 Follower 成员启动 logSyncer Goroutine, 承担日志同步与心跳的功能
+	for server, _ := range rf.peers {
+		if server == rf.me {
+			continue
 		}
+		go rf.logSyncer(server, currentTerm)
+	}
 
-		// 心跳周期计时器
+	for !rf.killed() {
+		// 定时检查 rf.matchIdx, 更新 rf.commitIdx
 		timeout := make(chan struct{}, 1)
-		go startTimer(timeout, TImerScene_Heartbeat)
-
-		resetLeader := make(chan int)
-		exit := make(chan struct{})
-		go rf.listenResetTimer(ResetTimerScene_Leader, resetLeader, exit, currentTerm)
+		go startTimer(timeout, TimerScene_LogChecker)
 
 		select {
 		case <-timeout:
-			// 开始新的心跳周期
-			exit <- struct{}{}
-			DPrintf(dHeartbeat, LogCommonFormat+", Begin a new round of heartbeat rpc", logArgs[:3])
-		case eventTerm := <-resetLeader:
-			logArgs = append(logArgs[:3], eventTerm)
-			DPrintf(dStatusSwitch, LogCommonFormat+", (*Raft).leader receive ResetLeader, event T%v", logArgs)
-			return
+			rf.mu.Lock()
+			if currentTerm != rf.currentTerm {
+				// 通过任期检测, 不再为 Leader
+				rf.mu.Unlock()
+				return
+			}
+
+			newCommitIdx := rf.maxIndexForCommit()
+			prevCommitIdx := rf.commitIdx
+			// 注意: 只能提交当前任期的日志
+			if newCommitIdx > prevCommitIdx &&
+				rf.log[rf.getLocalIndex(newCommitIdx)].Term == currentTerm {
+				logStr, _ := sonic.MarshalString(rf.log[rf.getLocalIndex(prevCommitIdx)+1 : rf.getLocalIndex(newCommitIdx)+1])
+				DPrintf(dCommit, LogCommonFormat+", commitIdx %v -> %v, entries: %v",
+					[]interface{}{rf.me, rf.status, currentTerm, prevCommitIdx, newCommitIdx, logStr})
+				rf.commitIdx = newCommitIdx
+				// 通知 applier Goroutine 新的日志条目被提交
+				rf.logCommit.Broadcast()
+			}
+			rf.mu.Unlock()
 		}
 	}
-}
-
-// heartbeat 向成员 server 发送心跳
-// TODO 2B 实验补充日志相关内容
-func (rf *Raft) heartbeat(server int, argTerm int) {
-	args := &AppendEntriesArgs{
-		Term:         argTerm,
-		LeaderId:     rf.me,
-		PrevLogIdx:   InitLogIndex,
-		PrevLogTerm:  InitLogTerm,
-		Entries:      make([]*LogEntry, 0),
-		LeaderCommit: InitLogIndex,
-	}
-	argStr, _ := sonic.MarshalString(args)
-	DPrintf(dHeartbeat, "S%v send Heartbeat rpc to S%v, args=%v", []interface{}{rf.me, server, argStr})
-
-	reply := &AppendEntriesReply{}
-	ok := rf.sendAppendEntries(server, args, reply)
-	if !ok {
-		DPrintf(dError, "S%v T%v, send Heartbeat to S%v failed", []interface{}{rf.me, argTerm, server})
-		return
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	replyStr, _ := sonic.MarshalString(reply)
-	currentTerm := rf.currentTerm
-	DPrintf(dHeartbeat, "S%v T%v, receive Heartbeat reply from S%v, replyStr=%v",
-		[]interface{}{rf.me, currentTerm, server, replyStr})
-
-	if reply.Term > currentTerm {
-		// 当前节点为过去任期, 切换为 Follower, 更新任期
-		rf.follower(reply.Term, nil)
-		return
-	}
-
-	if currentTerm != argTerm {
-		// 当前任期不等于发出请求时的任期, 不请求响应结果
-		return
-	}
-	// TODO
 }

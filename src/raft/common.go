@@ -23,8 +23,9 @@ const (
 type TimerScene int64
 
 const (
-	TimerScene_Selection TimerScene = 1
-	TImerScene_Heartbeat TimerScene = 2
+	TimerScene_Selection  TimerScene = 1
+	TimeScene_RPC                    = 2
+	TimerScene_LogChecker TimerScene = 3
 )
 
 type ResetTimerScene int64
@@ -32,11 +33,10 @@ type ResetTimerScene int64
 const (
 	ResetTimerScene_SelectionTimer ResetTimerScene = 1
 	ResetTimerScene_Candidate      ResetTimerScene = 2
-	ResetTimerScene_Leader         ResetTimerScene = 3
 )
 
 const (
-	InitLogIndex = -1
+	InitLogIndex = 0
 	InitLogTerm  = -1
 )
 
@@ -84,8 +84,6 @@ func (scene ResetTimerScene) String() string {
 	switch scene {
 	case ResetTimerScene_SelectionTimer:
 		return "ResetSelectionTimer"
-	case ResetTimerScene_Leader:
-		return "ResetLeader"
 	case ResetTimerScene_Candidate:
 		return "ResetCandidate"
 	default:

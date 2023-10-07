@@ -32,6 +32,7 @@ TOPICS = {
     "Append": "#ff0049",
     "StatusSwitch": "#3f00ff",
     "Selection": "#fcff00",
+    "Apply": "#00ff4f",
 }
 # fmt: on
 

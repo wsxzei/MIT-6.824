@@ -211,6 +211,9 @@ def run_tests(
                         test, path, rc, runtime = future.result()
 
                         results[test]['completed'].add(1)
+                        # if results[test]['completed'].n % 100 == 0:
+                        #     completed_times = results[test]['completed'].n
+                        #     print(f"{test} completed {completed_times} times\n")
                         results[test]['time'].add(runtime)
                         task_progress.update(tasks[test], advance=1)
                         dest = (output / f"{test}_{completed}.log").as_posix()  # 文件名称

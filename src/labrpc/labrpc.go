@@ -219,6 +219,7 @@ func (rn *Network) processReq(req reqMsg) {
 	enabled, servername, server, reliable, longreordering := rn.readEndnameInfo(req.endname)
 
 	if enabled && servername != nil && server != nil {
+		// 不可靠的网络环境, 最高可能延迟27ms, 并且有 10% 概率丢弃 RPC 请求
 		if reliable == false {
 			// short delay
 			ms := (rand.Int() % 27)
@@ -290,6 +291,7 @@ func (rn *Network) processReq(req reqMsg) {
 			req.replyCh <- reply
 		}
 	} else {
+		// notice: 如果禁用某个服务器的网络, 且设置了 longDelays 参数, 最高可能会有 7s 的延迟, 这将导致发送 RPC 请求的 Goroutine 长时间阻塞
 		// simulate no reply and eventual timeout.
 		ms := 0
 		if rn.longDelays {
@@ -379,11 +381,9 @@ func (rn *Network) GetTotalBytes() int64 {
 	return x
 }
 
-//
 // a server is a collection of services, all sharing
 // the same rpc dispatcher. so that e.g. both a Raft
 // and a k/v server can listen to the same rpc endpoint.
-//
 type Server struct {
 	mu       sync.Mutex
 	services map[string]*Service

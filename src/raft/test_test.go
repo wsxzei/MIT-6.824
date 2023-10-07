@@ -128,6 +128,7 @@ func TestBasicAgree2B(t *testing.T) {
 
 	iters := 3
 	for index := 1; index < iters+1; index++ {
+		// 检测未调用 Start 前, 是否有日志已经提交
 		nd, _ := cfg.nCommitted(index)
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
@@ -142,10 +143,8 @@ func TestBasicAgree2B(t *testing.T) {
 	cfg.end()
 }
 
-//
 // check, based on counting bytes of RPCs, that
 // each command is sent to each peer just once.
-//
 func TestRPCBytes2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -314,6 +313,7 @@ loop:
 
 		failed := false
 		cmds := []int{}
+		// 5 条命令需要在任期 term, 在所有成员(servers) 的状态机上提交
 		for index := range is {
 			cmd := cfg.wait(index, servers, term)
 			if ix, ok := cmd.(int); ok {
@@ -330,6 +330,7 @@ loop:
 			}
 		}
 
+		// 失败次数超过 5 次, 测试失败
 		if failed {
 			// avoid leaking goroutines
 			go func() {
@@ -339,6 +340,7 @@ loop:
 			continue
 		}
 
+		// 5 个日志条目均被提交(校验命令的正确性)
 		for ii := 0; ii < iters; ii++ {
 			x := 100 + ii
 			ok := false
@@ -514,6 +516,7 @@ loop:
 			continue
 		}
 		cmds := []int{}
+		// 连续 11 个命令需要被同一个任期内的 Leader 按照顺序 submit
 		for i := 1; i < iters+2; i++ {
 			x := int(rand.Int31())
 			cmds = append(cmds, x)
@@ -531,6 +534,7 @@ loop:
 			}
 		}
 
+		// 等待这 10 条命令对应的日志条目被提交到 Raft 集群的所有成员的日志
 		for i := 1; i < iters+1; i++ {
 			cmd := cfg.wait(starti+i, servers, term)
 			if ix, ok := cmd.(int); ok == false || ix != cmds[i-1] {
@@ -542,6 +546,7 @@ loop:
 			}
 		}
 
+		// 提交这 11 个命令的过程中, 任期不能改变
 		failed := false
 		total2 = 0
 		for j := 0; j < servers; j++ {
@@ -557,6 +562,8 @@ loop:
 			continue loop
 		}
 
+		// 提交日志并达成共识的过程中, 一个集群的 rpc 数量不能超出: iters + 1 + 3
+		// 理论上最少: iters + 1 条日志的 AppendEntries 和 更新 commitIndex 的心跳 RPC, 共 iters + 2
 		if total2-total1 > (iters+1+3)*3 {
 			t.Fatalf("too many RPCs (%v) for %v entries\n", total2-total1, iters)
 		}
@@ -576,6 +583,7 @@ loop:
 		total3 += cfg.rpcCount(j)
 	}
 
+	// cfg.wait 中至多等待 1s
 	if total3-total2 > 3*20 {
 		t.Fatalf("too many RPCs (%v) for 1 second of idleness\n", total3-total2)
 	}
@@ -705,7 +713,6 @@ func TestPersist32C(t *testing.T) {
 	cfg.end()
 }
 
-//
 // Test the scenarios described in Figure 8 of the extended Raft paper. Each
 // iteration asks a leader, if there is one, to insert a command in the Raft
 // log.  If there is a leader, that leader will fail quickly with a high
@@ -714,7 +721,6 @@ func TestPersist32C(t *testing.T) {
 // alive servers isn't enough to form a majority, perhaps start a new server.
 // The leader in a new term may try to finish replicating log entries that
 // haven't been committed yet.
-//
 func TestFigure82C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)

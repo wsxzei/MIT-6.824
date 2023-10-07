@@ -13,7 +13,9 @@ func startTimer(timeChan chan struct{}, timerScene TimerScene) {
 	switch timerScene {
 	case TimerScene_Selection:
 		timeout = GenRandSelectionTimeout()
-	case TImerScene_Heartbeat:
+	case TimerScene_LogChecker:
+		timeout = HeartbeatPeriod / 10
+	case TimeScene_RPC:
 		timeout = HeartbeatPeriod
 	}
 	time.Sleep(timeout)
@@ -33,22 +35,24 @@ func (rf *Raft) listenResetTimer(scene ResetTimerScene, resetTimer chan int, exi
 		rcvFrom = rf.resetSelectionTimer
 	case ResetTimerScene_Candidate:
 		rcvFrom = rf.resetCandidate
-	case ResetTimerScene_Leader:
-		rcvFrom = rf.resetLeader
 	}
 	if rcvFrom == nil {
 		log.Panicf("S%v %v expectT%v, Invalid ResetTimerScene", rf.me, scene.String(), expectTerm)
 	}
+	rcvCh := rcvFrom.ReceiveAsync()
 
-	for !rf.killed() {
+	// 两种情况下退出 for-loop:
+	// 1. 成功发送事件任期到 resetTimer channel
+	// 2. 从 exit channel 成功接收退出信息
+	for {
 		select {
-		case eventTerm, ok := <-rcvFrom.ReceiveAsync():
+		case eventTerm, ok := <-rcvCh:
 			if !ok {
 				DPrintf(dError, "S%v %v, expect T%v, event T%v, BufferIntChan.out is closed",
 					[]interface{}{rf.me, scene.String(), expectTerm, eventTerm})
-				return
+				rcvCh = nil
+				continue
 			}
-			DPrintf(dTimer, "S%v %v, expect T%v, event T%v", []interface{}{rf.me, scene.String(), expectTerm, eventTerm})
 			// 收到任期大于等于 expectTerm 时发送来的消息, 重置定时器
 			if eventTerm >= expectTerm {
 				select {
