@@ -31,6 +31,7 @@ const (
 	dWarn         logTopic = "WARN"
 	dStatusSwitch logTopic = "StatusSwitch"
 	dSelection    logTopic = "Selection"
+	dKill         logTopic = "Kill"
 )
 
 var debugStart time.Time

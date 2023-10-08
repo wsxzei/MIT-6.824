@@ -496,7 +496,9 @@ func (rf *Raft) Kill() {
 
 	// 释放BufferChan
 	rf.resetSelectionTimer.Kill()
+	DPrintf(dKill, "S%v rf.resetSelectionTimer killed", []interface{}{rf.me})
 	rf.resetCandidate.Kill()
+	DPrintf(dKill, "S%v rf.resetCandidate killed", []interface{}{rf.me})
 }
 
 func (rf *Raft) killed() bool {
