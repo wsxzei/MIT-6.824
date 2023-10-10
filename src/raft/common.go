@@ -37,7 +37,7 @@ const (
 
 const (
 	InitLogIndex = 0
-	InitLogTerm  = -1
+	InitVotedFor = -1
 )
 
 const (

@@ -321,3 +321,57 @@ func TestAppendEntries(t *testing.T) {
 func TestTicker(t *testing.T) {
 
 }
+
+func TestPersistAndReadPersist(t *testing.T) {
+	PatchConvey("Test Persister", t, func() {
+		persister := MakePersister()
+
+		rf := &Raft{
+			me:        0,
+			peers:     []*labrpc.ClientEnd{{}, {}, {}},
+			persister: persister,
+
+			currentTerm: 2,
+		}
+
+		rf2 := &Raft{
+			me:        0,
+			peers:     []*labrpc.ClientEnd{{}, {}, {}},
+			persister: persister,
+		}
+
+		PatchConvey("rf.votedFor isn't nil", func() {
+			rf.votedFor = NewInt(1)
+			rf.log = []*LogEntry{{}, {Term: 1, Command: "Hello World"}, {Term: 1, Command: 3}}
+
+			rf.persist()
+			rf2.readPersist(persister.ReadRaftState())
+
+			So(rf2.currentTerm, ShouldEqual, 2)
+			So(*rf2.votedFor, ShouldEqual, 1)
+			So(rf2.log, ShouldResemble, []*LogEntry{{}, {Term: 1, Command: "Hello World"}, {Term: 1, Command: 3}})
+		})
+
+		PatchConvey("rf.votedFor is nil", func() {
+			rf.log = []*LogEntry{{}, {Term: 1, Command: "Hello World"}, {Term: 1, Command: 3}}
+
+			rf.persist()
+			rf2.readPersist(persister.ReadRaftState())
+
+			So(rf2.currentTerm, ShouldEqual, 2)
+			So(rf2.votedFor, ShouldBeNil)
+			So(rf2.log, ShouldResemble, []*LogEntry{{}, {Term: 1, Command: "Hello World"}, {Term: 1, Command: 3}})
+		})
+
+		PatchConvey("rf.log includes only dummy entry", func() {
+			rf.log = []*LogEntry{{}}
+
+			rf.persist()
+			rf2.readPersist(persister.ReadRaftState())
+
+			So(rf2.currentTerm, ShouldEqual, 2)
+			So(rf2.votedFor, ShouldBeNil)
+			So(rf2.log, ShouldResemble, []*LogEntry{{}})
+		})
+	})
+}

@@ -743,19 +743,23 @@ func TestFigure82C(t *testing.T) {
 		}
 
 		if (rand.Int() % 1000) < 100 {
+			// 10% 概率睡眠 0~500ms后再下线 leader, 从而很有可能提交日志
 			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		} else {
+			// 快速下线 leader, 使得大量日志条目无法提交
 			ms := (rand.Int63() % 13)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 
 		if leader != -1 {
+			// 下线 leader 节点
 			cfg.crash1(leader)
 			nup -= 1
 		}
 
 		if nup < 3 {
+			// 上线机器不构成集群成员的大多数, 启动新的服务器
 			s := rand.Int() % servers
 			if cfg.rafts[s] == nil {
 				cfg.start1(s, cfg.applier)
@@ -765,6 +769,7 @@ func TestFigure82C(t *testing.T) {
 		}
 	}
 
+	// 重启所有服务器
 	for i := 0; i < servers; i++ {
 		if cfg.rafts[i] == nil {
 			cfg.start1(i, cfg.applier)
