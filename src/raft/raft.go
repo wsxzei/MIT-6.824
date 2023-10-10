@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"github.com/bytedance/sonic"
 	"log"
 	//	"bytes"
@@ -124,6 +126,7 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+// Note: call persist() while holding the mutex rf.mu
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -133,6 +136,39 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+
+	err := encoder.Encode(rf.currentTerm)
+	if err != nil {
+		DPrintf(dError, LogCommonFormat+", encoder.Encode(currentStatus) failed, err=%v",
+			[]interface{}{rf.me, rf.status, rf.currentTerm, err})
+		return
+	}
+
+	// 注: gob 不能序列化空指针
+	err = encoder.Encode(IntPtrToVal(rf.votedFor, InitVotedFor))
+	if err != nil {
+		DPrintf(dError, LogCommonFormat+", encoder.Encode(votedFor) failed, err=%v",
+			[]interface{}{rf.me, rf.status, rf.currentTerm, err})
+		return
+	}
+
+	err = encoder.Encode(rf.log)
+	if err != nil {
+		DPrintf(dError, LogCommonFormat+", encoder.Encode(rf.log) failed, err=%v",
+			[]interface{}{rf.me, rf.status, rf.currentTerm, err})
+		return
+	}
+
+	// 序列化Raft的持久化状态
+	data := buffer.Bytes()
+
+	rf.persister.SaveRaftState(data)
+	DPrintf(dPersist, LogCommonFormat+" rf.persist, votedFor S%v, LastLogEntry(Idx%v, T%v, Command %v)",
+		[]interface{}{rf.me, rf.status, rf.currentTerm, IntPtrToVal(rf.votedFor, InitVotedFor),
+			rf.getGlobalIndex(len(rf.log) - 1), rf.log[len(rf.log)-1].Term, rf.log[len(rf.log)-1].Command})
 }
 
 // restore previously persisted state.
@@ -153,6 +189,50 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+
+	var (
+		currentTerm int
+		votedFor    int
+		logEntries  []*LogEntry
+	)
+
+	// 入参一定要为指针类型
+	err := decoder.Decode(&currentTerm)
+	if err != nil {
+		DPrintf(dError, "decoder.Decode(&currentTerm) failed, err=%v",
+			[]interface{}{err})
+		return
+	}
+	err = decoder.Decode(&votedFor)
+	if err != nil {
+		DPrintf(dError, "decoder.Decode(&votedFor) failed, err=%v",
+			[]interface{}{err})
+		return
+	}
+	err = decoder.Decode(&logEntries)
+	if err != nil {
+		DPrintf(dError, "decoder.Decode(&votedFor) failed, err=%v",
+			[]interface{}{err})
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.currentTerm = currentTerm
+	if votedFor != InitVotedFor {
+		rf.votedFor = NewInt(votedFor)
+	}
+	rf.log = logEntries
+
+	// TODO 恢复快照的索引和任期
+
+	DPrintf(dPersist, LogCommonFormat+" rf.readPersist, votedFor S%v, LastLogEntry(Idx%v, T%v, Command %v)",
+		[]interface{}{rf.me, NodeStateEnum_Follower, currentTerm, votedFor,
+			rf.getGlobalIndex(len(logEntries) - 1), rf.log[len(logEntries)-1].Term, rf.log[len(logEntries)-1].Command})
+	return
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -238,6 +318,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.upToDate(args.LastLogIndex, args.LastLogTerm) {
 			voteFor = NewInt(args.CandidateId)
 			rf.votedFor = voteFor
+			rf.persist() // persistence of votedFor
 		}
 	}
 
@@ -416,6 +497,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	for i := appendBegin; i < len(args.Entries); i++ {
 		rf.log = append(rf.log, args.Entries[i])
 	}
+	rf.persist() // persistence of log
 
 	// 更新 commitIdx, 通知 applier 应用新日志到状态机
 	commitIdx := MinInt(args.LeaderCommit, args.PrevLogIdx+len(args.Entries))
@@ -470,6 +552,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	rf.log = append(rf.log, entry)
 	rf.matchIdx[rf.me] = index
 	rf.nextIdx[rf.me] = index + 1
+	rf.persist() // persistence of log
 
 	DPrintf(dLog, LogCommonFormat+", submit a new entry(index %v), command=%v",
 		[]interface{}{rf.me, rf.status.String(), term, index, command})

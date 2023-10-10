@@ -44,6 +44,8 @@ func (rf *Raft) candidate(expectTerm int) {
 	rf.status = NodeStateEnum_Candidate
 	rf.currentTerm++
 	rf.votedFor = NewInt(rf.me)
+	rf.persist() // persistence of votedFor and currentTerm
+
 	voterSet[rf.me] = struct{}{}
 	logArgs = []interface{}{rf.me, rf.status.String(), rf.currentTerm}
 
@@ -162,6 +164,7 @@ func (rf *Raft) follower(targetTerm int, voteFor *int) {
 	rf.status = NodeStateEnum_Follower
 	rf.votedFor = voteFor
 	logArgs[1] = NodeStateEnum_Follower.String()
+	rf.persist() // persistence of votedFor and currentTerm
 
 	switch currentStatus {
 	case NodeStateEnum_Leader:
