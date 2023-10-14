@@ -18,7 +18,7 @@ import (
 // 存在任期改变, 但不需要重置定时器的情况
 // RequestVote 投赞成票, 重置Timer 和 切换Follower并发, 可能导致expectTerm小于当前任期
 func (rf *Raft) candidate(expectTerm int) {
-	rf.mu.Lock()
+	rf.Lock("[rf.candidate] begin")
 
 	logArgs := []interface{}{rf.me, rf.status.String(), rf.currentTerm}
 	DPrintf(dStatusSwitch, LogCommonFormat+", Switch To Candidate", logArgs)
@@ -28,7 +28,7 @@ func (rf *Raft) candidate(expectTerm int) {
 	// 2. 收到大于 expectTerm 任期的 Leader 心跳, votedFor 设置为 LeaderId
 	// 注: resetCandidate 和 resetSelectionTimer 重置计时器存在延迟, 需要额外校验
 	if rf.currentTerm != expectTerm && rf.votedFor != nil {
-		rf.mu.Unlock()
+		rf.Unlock("[rf.candidate] currentTerm changed, exit")
 		logArgs = append(logArgs, expectTerm, rf.votedFor)
 		DPrintf(dStatusSwitch, LogCommonFormat+" quit candidate, (expectTerm %v, votedFor %v) not matched", logArgs)
 		return
@@ -36,7 +36,7 @@ func (rf *Raft) candidate(expectTerm int) {
 
 	var (
 		lastLogIdx  = rf.getGlobalIndex(len(rf.log) - 1)
-		lastLogTerm = rf.log[len(rf.log)-1].Term    // 若没有日志条目, 设置为-1
+		lastLogTerm = rf.log[len(rf.log)-1].Term    // 若没有日志条目, 设置为快照的任期
 		voteCh      = make(chan int, len(rf.peers)) // RequestVote Handler协程传递收到的赞成票
 		voterSet    = make(map[int]struct{})        // 用于统计投票数, 具有去重的作用
 	)
@@ -62,7 +62,7 @@ func (rf *Raft) candidate(expectTerm int) {
 		}
 		go rf.requestVoteTask(i, voteReq, voteCh)
 	}
-	rf.mu.Unlock()
+	rf.Unlock("[rf.candidate] before starting selection timer")
 
 	timeout := make(chan struct{}, 1) // timer协程传递超时信号
 	// 定时器 Goroutine
@@ -119,8 +119,8 @@ func (rf *Raft) requestVoteTask(server int, voteReq *RequestVoteArgs, voteCh cha
 	DPrintf(dVote, "S%v T%v, receive RequestVote reply from S%v, reply=%v",
 		[]interface{}{rf.me, voteReq.Term, server, respStr})
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.Lock("[rf.requestVoteTask] begin")
+	defer rf.Unlock("[rf.requestTask] end")
 
 	if rf.currentTerm < voteResp.Term {
 		// 响应数据中的任期大于当前任期, 切换为Follower
@@ -192,14 +192,14 @@ func (rf *Raft) follower(targetTerm int, voteFor *int) {
 // leader candidate()赢得选举后, 切换为Leader状态
 // expectTerm 为 Leader 的任期
 func (rf *Raft) leader(expectTerm int) {
-	rf.mu.Lock()
+	rf.Lock("[rf.leader] begin")
 
 	currentTerm := rf.currentTerm
 	logArgs := []interface{}{rf.me, rf.status.String(), currentTerm, expectTerm}
 	DPrintf(dStatusSwitch, LogCommonFormat+", Switch To Leader, expect T%v", logArgs)
 
 	if currentTerm != expectTerm {
-		rf.mu.Unlock()
+		rf.Unlock("[rf.leader] currentTerm changed, exit")
 		return
 	}
 
@@ -216,7 +216,7 @@ func (rf *Raft) leader(expectTerm int) {
 		rf.nextIdx[i] = rf.getGlobalIndex(len(rf.log))
 	}
 
-	rf.mu.Unlock()
+	rf.Unlock("[rf.leader] before start log check timer")
 	logArgs[1] = NodeStateEnum_Leader.String()
 
 	// Leader 为每个 Follower 成员启动 logSyncer Goroutine, 承担日志同步与心跳的功能
@@ -234,10 +234,10 @@ func (rf *Raft) leader(expectTerm int) {
 
 		select {
 		case <-timeout:
-			rf.mu.Lock()
+			rf.Lock("[rf.leader] a new round of log check")
 			if currentTerm != rf.currentTerm {
 				// 通过任期检测, 不再为 Leader
-				rf.mu.Unlock()
+				rf.Unlock("[rf.leader] currentTerm changed in log check")
 				return
 			}
 
@@ -253,7 +253,7 @@ func (rf *Raft) leader(expectTerm int) {
 				// 通知 applier Goroutine 新的日志条目被提交
 				rf.logCommit.Broadcast()
 			}
-			rf.mu.Unlock()
+			rf.Unlock("[rf.leader] end a round of log check")
 		}
 	}
 }

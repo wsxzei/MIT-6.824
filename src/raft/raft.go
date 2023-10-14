@@ -72,11 +72,10 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	/* 持久化状态 */
-	currentTerm  int  // 当前任期
-	votedFor     *int // 给 peers[] 中的哪个成员投票(设置成唯一ID)
-	log          []*LogEntry
-	snapshotIdx  int // 快照中最后一个条目的索引
-	snapshotTerm int // 快照中最后一个条目的任期
+	currentTerm int         // 当前任期
+	votedFor    *int        // 给 peers[] 中的哪个成员投票(设置成唯一ID)
+	log         []*LogEntry // 注: 快照的任期保存在 Entry 数组的第一个元素中
+	snapshotIdx int         // 快照中最后一个条目的索引
 
 	/* 易失状态 */
 	status      NodeStateEnum
@@ -114,8 +113,8 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isLeader bool
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.Lock("[rf.GetState] begin")
+	defer rf.Unlock("[rf.GetState] exit")
 	isLeader = rf.status == NodeStateEnum_Leader
 	term = rf.currentTerm
 
@@ -137,38 +136,46 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
+	raftState, err := rf.encodeRaftState()
+	if err != nil {
+		log.Panicf(LogCommonFormat+", rf.encodeRaftState failed, err=%v", rf.me, rf.status, rf.currentTerm, err)
+		return
+	}
+
+	rf.persister.SaveRaftState(raftState)
+
+	logStr, _ := sonic.MarshalString(rf.log)
+	DPrintf(dPersist, LogCommonFormat+" rf.persist, votedFor S%v, snapshotIdx %v, log %v",
+		[]interface{}{rf.me, rf.status, rf.currentTerm, IntPtrToVal(rf.votedFor, InitVotedFor), rf.snapshotIdx, logStr})
+}
+
+func (rf *Raft) encodeRaftState() (raftState []byte, err error) {
 	buffer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(buffer)
 
-	err := encoder.Encode(rf.currentTerm)
+	err = encoder.Encode(rf.currentTerm)
 	if err != nil {
-		DPrintf(dError, LogCommonFormat+", encoder.Encode(currentStatus) failed, err=%v",
-			[]interface{}{rf.me, rf.status, rf.currentTerm, err})
 		return
 	}
 
 	// 注: gob 不能序列化空指针
 	err = encoder.Encode(IntPtrToVal(rf.votedFor, InitVotedFor))
 	if err != nil {
-		DPrintf(dError, LogCommonFormat+", encoder.Encode(votedFor) failed, err=%v",
-			[]interface{}{rf.me, rf.status, rf.currentTerm, err})
+		return
+	}
+
+	err = encoder.Encode(rf.snapshotIdx)
+	if err != nil {
 		return
 	}
 
 	err = encoder.Encode(rf.log)
 	if err != nil {
-		DPrintf(dError, LogCommonFormat+", encoder.Encode(rf.log) failed, err=%v",
-			[]interface{}{rf.me, rf.status, rf.currentTerm, err})
 		return
 	}
 
-	// 序列化Raft的持久化状态
-	data := buffer.Bytes()
-
-	rf.persister.SaveRaftState(data)
-	DPrintf(dPersist, LogCommonFormat+" rf.persist, votedFor S%v, LastLogEntry(Idx%v, T%v, Command %v)",
-		[]interface{}{rf.me, rf.status, rf.currentTerm, IntPtrToVal(rf.votedFor, InitVotedFor),
-			rf.getGlobalIndex(len(rf.log) - 1), rf.log[len(rf.log)-1].Term, rf.log[len(rf.log)-1].Command})
+	raftState = buffer.Bytes()
+	return
 }
 
 // restore previously persisted state.
@@ -195,6 +202,7 @@ func (rf *Raft) readPersist(data []byte) {
 	var (
 		currentTerm int
 		votedFor    int
+		snapshotIdx int
 		logEntries  []*LogEntry
 	)
 
@@ -211,6 +219,14 @@ func (rf *Raft) readPersist(data []byte) {
 			[]interface{}{err})
 		return
 	}
+
+	err = decoder.Decode(&snapshotIdx)
+	if err != nil {
+		DPrintf(dError, "dcoder.Decode(&snapshotIdx) failed, err=%v",
+			[]interface{}{err})
+		return
+	}
+
 	err = decoder.Decode(&logEntries)
 	if err != nil {
 		DPrintf(dError, "decoder.Decode(&votedFor) failed, err=%v",
@@ -218,20 +234,19 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.Lock("[rf.readPersist] begin")
+	defer rf.Unlock("[rf.readPersist] end")
 
 	rf.currentTerm = currentTerm
 	if votedFor != InitVotedFor {
 		rf.votedFor = NewInt(votedFor)
 	}
+	rf.snapshotIdx = snapshotIdx
 	rf.log = logEntries
+	logStr, _ := sonic.MarshalString(rf.log)
 
-	// TODO 恢复快照的索引和任期
-
-	DPrintf(dPersist, LogCommonFormat+" rf.readPersist, votedFor S%v, LastLogEntry(Idx%v, T%v, Command %v)",
-		[]interface{}{rf.me, NodeStateEnum_Follower, currentTerm, votedFor,
-			rf.getGlobalIndex(len(logEntries) - 1), rf.log[len(logEntries)-1].Term, rf.log[len(logEntries)-1].Command})
+	DPrintf(dPersist, LogCommonFormat+" rf.readPersist, votedFor S%v, snapshotIdx %v, log %v",
+		[]interface{}{rf.me, NodeStateEnum_Follower, currentTerm, votedFor, snapshotIdx, logStr})
 	return
 }
 
@@ -240,8 +255,58 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
+	rf.Lock("[rf.CondInstallSnapshot] begin")
+	defer rf.Unlock("[rf.CondInstallSnapshot] end")
 
-	return true
+	// existing snapshot's lastIndex isn't less than lastIncludedIndex, don't apply snapshot to service
+	if rf.snapshotIdx >= lastIncludedIndex {
+		return false
+	}
+
+	// match local log entry with lastIncludedIndex and lastIncludedTerm
+	// 1. if the match is successful, substitute the old snapshot with args.Snapshot,
+	//  	and discard the entry before lastIncludedIndex(including)
+	// 2. if the match fails, substitute the old snapshot and discard all log entries
+	match := false
+	localLastIdx := rf.getLocalIndex(lastIncludedIndex)
+	if localLastIdx < len(rf.log) && rf.log[localLastIdx].Term == lastIncludedTerm {
+		match = true
+	}
+
+	if match {
+		rf.deleteTo(lastIncludedIndex)
+		rf.snapshotIdx = lastIncludedIndex
+	} else {
+		rf.deleteTo(rf.getGlobalIndex(len(rf.log) - 1))
+		rf.log[0].Term = lastIncludedTerm  // snapshot last entry's term
+		rf.snapshotIdx = lastIncludedIndex // snapshot last entry's index
+	}
+
+	DPrintf(dSnap, LogCommonFormat+", CondInstallSnapshot (snapshotIdx, snapshotTerm)=(%v, %v)",
+		[]interface{}{rf.me, rf.status, rf.currentTerm, rf.snapshotIdx, rf.log[0].Term})
+
+	raftState, err := rf.encodeRaftState()
+	if err != nil {
+		log.Panicf(LogCommonFormat+", [rf.CondInstallSnapshot] rf.encodeRaftState failed, err=%v", rf.me, rf.status, rf.currentTerm, err)
+	}
+
+	rf.persister.SaveStateAndSnapshot(raftState, snapshot)
+
+	// update rf.commitIdx and rf.lastApplied if necessary,
+	// but don't need to notify the applier Goroutine.
+	// note: it's possible snapshot ApplyMsg is sent to service
+	//   	before the entries whose index is less than or equal to lastApplied
+	if rf.lastApplied < rf.snapshotIdx {
+		commitIdx := MaxInt(rf.commitIdx, rf.snapshotIdx)
+		DPrintf(dSnap, LogCommonFormat+", CondInstallSnapshot return true, lastApplied %v->%v, commitIdx %v->%v",
+			[]interface{}{rf.me, rf.status, rf.currentTerm, rf.lastApplied, rf.snapshotIdx, rf.commitIdx, commitIdx})
+		rf.commitIdx = commitIdx
+		rf.lastApplied = rf.snapshotIdx
+		return true
+	}
+
+	// don't need to apply snapshot to service
+	return false
 }
 
 // the service says it has created a snapshot that has
@@ -250,7 +315,106 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.Lock("[rf.Snapshot] begin")
+	defer rf.Unlock("[rf.Snapshot] end")
 
+	if rf.snapshotIdx >= index {
+		return
+	}
+
+	if rf.getLocalIndex(index) >= len(rf.log) {
+		log.Panicf(LogCommonFormat+", rf.Snapshot, index %v > len(log) %v",
+			rf.me, rf.status, rf.currentTerm, rf.getLocalIndex(index), len(rf.log))
+	}
+
+	// step1: Delete local log from the first entries to the index corresponding entries
+	rf.deleteTo(index)
+
+	// step2: Update snapshotIdx
+	rf.snapshotIdx = index
+
+	// step3: Use Persister to persist raftState and snapshot
+	raftState, err := rf.encodeRaftState()
+	if err != nil {
+		log.Panicf(LogCommonFormat+", [rf.Snapshot] rf.encodeRaftState failed, err=%v", rf.me, rf.status, rf.currentTerm, err)
+	}
+	rf.persister.SaveStateAndSnapshot(raftState, snapshot)
+	DPrintf(dSnap, LogCommonFormat+", rf.Snapshot(Idx=%v), (snapshotIdx, snapshotTerm)=(%v, %v)",
+		[]interface{}{rf.me, rf.status, rf.currentTerm, index, rf.snapshotIdx, rf.log[0].Term})
+}
+
+type InstallSnapshotArgs struct {
+	Term      int
+	LeaderId  int
+	LastIndex int
+	LastTerm  int
+	Snapshot  []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.Lock("[rf.InstallSnapshot] begin")
+
+	currentTerm := rf.currentTerm
+	currentStatus := rf.status
+	reply.Term = currentTerm
+
+	argStr, _ := sonic.MarshalString(args)
+	logArgs := []interface{}{rf.me, currentStatus, currentTerm, argStr}
+	DPrintf(dSnap, LogCommonFormat+", InstallSnapshot Args=%v", logArgs)
+
+	if args.Term < currentTerm {
+		rf.Unlock("[rf.InstallSnapshot] argsTerm is less than currentTerm")
+		return
+	}
+
+	if args.Term > currentTerm {
+		rf.follower(args.Term, NewInt(args.LeaderId))
+	}
+
+	if args.Term == currentTerm {
+		if currentStatus == NodeStateEnum_Candidate {
+			rf.follower(args.Term, rf.votedFor)
+		} else if currentStatus == NodeStateEnum_Leader {
+			rf.Unlock("[rf.InstallSnapshot] incorrect currentStatus, before panic")
+			log.Panicf(LogCommonFormat+", InstallSnapshot Handler, the num of Leader is more than one", rf.me, rf.status, rf.currentTerm)
+		}
+	}
+
+	rf.Unlock("[rf.InstallSnapshot] end")
+
+	// reset Heartbeat timer
+	if currentStatus == NodeStateEnum_Follower {
+		go func() {
+			ok := rf.resetSelectionTimer.Send(currentTerm)
+			if !ok {
+				DPrintf(dError, LogCommonFormat+", InstallSnapshot Handler, rf.resetSelectionTimer.Send failed", logArgs[:3])
+				return
+			}
+			DPrintf(dHeartbeat, LogCommonFormat+", InstallSnapshot Handler, rf.resetSelectionTimer.Send success", logArgs[:3])
+		}()
+	}
+
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Snapshot,
+		SnapshotTerm:  args.LastTerm,
+		SnapshotIndex: args.LastIndex,
+	}
+
+	go func() {
+		rf.applyCh <- applyMsg
+		msg, _ := sonic.MarshalString(applyMsg)
+		DPrintf(dApply, LogCommonFormat+", send applyMsg with snapshot, msg=%v", []interface{}{rf.me, currentStatus, currentTerm, msg})
+	}()
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
 }
 
 // example RequestVote RPC arguments structure.
@@ -259,8 +423,8 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int
 	CandidateId  int
-	LastLogIndex int // 若没有日志条目, 设置为 -1
-	LastLogTerm  int // 若没有日志条目, 设置为 -1
+	LastLogIndex int // 若本地日志无日志条目, 快照的索引
+	LastLogTerm  int // 若本地日志无日志条目, 快照的任期
 }
 
 // example RequestVote RPC reply structure.
@@ -279,8 +443,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		log.Panicf("RequestVote Handler, Invalid args or reply")
 	}
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.Lock("[rf.RequestVote] begin")
+	defer rf.Unlock("[rf.RequestVote] end")
 
 	currentTerm := rf.currentTerm
 	currentStatus := rf.status
@@ -402,8 +566,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		log.Panic("AppendEntries Handler, invalid args or reply")
 	}
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.Lock("[rf.AppendEntries] begin")
+	defer rf.Unlock("[rf.AppendEntries] end")
 
 	currentTerm := rf.currentTerm
 	currentStatus := rf.status
@@ -454,23 +618,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	localPrevLogIdx := rf.getLocalIndex(args.PrevLogIdx)
-	localPrevLogTerm := rf.log[localPrevLogIdx].Term
-	if localPrevLogTerm != args.PrevLogTerm {
-		conflictIdx := localPrevLogIdx
-		for idx := localPrevLogIdx; idx > 0; idx-- {
-			if rf.log[idx-1].Term == localPrevLogTerm {
-				conflictIdx = idx - 1
-			} else {
-				break
+	if localPrevLogIdx >= 0 {
+		localPrevLogTerm := rf.log[localPrevLogIdx].Term
+		if localPrevLogTerm != args.PrevLogTerm {
+			conflictIdx := localPrevLogIdx
+			for idx := localPrevLogIdx; idx > 0; idx-- {
+				if rf.log[idx-1].Term == localPrevLogTerm {
+					conflictIdx = idx - 1
+				} else {
+					break
+				}
 			}
-		}
-		reply.ConflictIdx = rf.getGlobalIndex(conflictIdx)
-		reply.ConflictTerm = NewInt(localPrevLogTerm)
+			reply.ConflictIdx = rf.getGlobalIndex(conflictIdx)
+			reply.ConflictTerm = NewInt(localPrevLogTerm)
 
-		replyStr, _ := sonic.MarshalString(reply)
-		DPrintf(dAppend, LogCommonFormat+", AppendEntries Handler, reply=%v",
-			[]interface{}{rf.me, currentStatus.String(), rf.currentTerm, replyStr})
-		return
+			replyStr, _ := sonic.MarshalString(reply)
+			DPrintf(dAppend, LogCommonFormat+", AppendEntries Handler, reply=%v",
+				[]interface{}{rf.me, currentStatus.String(), rf.currentTerm, replyStr})
+			return
+		}
 	}
 
 	// 通过一致性检查, 更新本地日志
@@ -479,7 +645,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	appendBegin := len(args.Entries) // args.Entries 中索引最小的新条目
 	for i, entry := range args.Entries {
 		logIdx := localPrevLogIdx + 1 + i
-		if logIdx < len(rf.log) && rf.log[logIdx].Term != entry.Term {
+		if logIdx <= 0 || logIdx >= len(rf.log) {
+			continue
+		}
+		if rf.log[logIdx].Term != entry.Term {
 			conflictIdx = NewInt(logIdx)
 			appendBegin = i
 			break
@@ -534,8 +703,8 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	isLeader = true
 
 	// Your code here (2B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.Lock("[rf.Start] begin")
+	defer rf.Unlock("[rf.Start] end")
 
 	if rf.status != NodeStateEnum_Leader {
 		isLeader = false
@@ -603,7 +772,7 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 
 		// 获取任期和状态
-		rf.mu.Lock()
+		rf.Lock("[rf.ticker] a new for-loop")
 		currentTerm := rf.currentTerm
 		status := rf.status
 
@@ -612,7 +781,7 @@ func (rf *Raft) ticker() {
 		switch status {
 		case NodeStateEnum_Follower:
 			// 在等待定时器超时前, 释放锁
-			rf.mu.Unlock()
+			rf.Unlock("[rf.ticker] status is Follower")
 
 			timeout := make(chan struct{}, 1) // buffered channel, 防止goroutine泄漏
 
@@ -643,11 +812,11 @@ func (rf *Raft) ticker() {
 			}
 		case NodeStateEnum_Leader, NodeStateEnum_Candidate:
 			// 等待切换为Follower
-			rf.toFollower.Wait()
+			rf.toFollowerWait("[rf.ticker] status is not follower, wait!")
 			DPrintf(dInfo, LogCommonFormat+", ticker ToFollower Signal Received", logArgs)
-			rf.mu.Unlock()
+			rf.Unlock("[rf.ticker] status is not follower")
 		default:
-			rf.mu.Unlock()
+			rf.Unlock("[rf.ticker] before panic")
 			log.Panicf(LogCommonFormat+", ticker unkonwn rf.status", logArgs...)
 		}
 	}
@@ -687,7 +856,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logCommit = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
+	// note: rf.commitIdx >= rf.lastApplied >= rf.snapshotIdx
 	rf.readPersist(persister.ReadRaftState())
+	rf.lastApplied = rf.snapshotIdx
+	rf.commitIdx = rf.snapshotIdx
 
 	// 启动 applier Goroutine, 将提交的日志条目应用到状态机
 	go rf.applier()

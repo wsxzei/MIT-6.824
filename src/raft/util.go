@@ -37,3 +37,50 @@ func MinInt(i1 int, i2 int) int {
 	}
 	return i2
 }
+
+func MaxInt(i1 int, i2 int) int {
+	if i1 < i2 {
+		return i2
+	}
+	return i1
+}
+
+func (rf *Raft) Lock(msg string) {
+	rf.mu.Lock()
+	if getVerbosity() > 2 {
+		DPrintf(dTest, "S%v acquire Lock, %v T%v, msg %v",
+			[]interface{}{rf.me, rf.status, rf.currentTerm, msg})
+	}
+}
+
+func (rf *Raft) Unlock(msg string) {
+	if getVerbosity() > 2 {
+		DPrintf(dTest, "S%v release Lock, %v T%v, msg %v",
+			[]interface{}{rf.me, rf.status, rf.currentTerm, msg})
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) toFollowerWait(msg string) {
+	if getVerbosity() > 2 {
+		DPrintf(dTest, "S%v release Lock, %v T%v, msg %v",
+			[]interface{}{rf.me, rf.status, rf.currentTerm, msg})
+	}
+	rf.toFollower.Wait()
+	if getVerbosity() > 2 {
+		DPrintf(dTest, "S%v acquire Lock, %v T%v, msg %v",
+			[]interface{}{rf.me, rf.status, rf.currentTerm, msg})
+	}
+}
+
+func (rf *Raft) logCommitWait(msg string) {
+	if getVerbosity() > 2 {
+		DPrintf(dTest, "S%v release Lock, %v T%v, msg %v",
+			[]interface{}{rf.me, rf.status, rf.currentTerm, msg})
+	}
+	rf.logCommit.Wait()
+	if getVerbosity() > 2 {
+		DPrintf(dTest, "S%v acquire Lock, %v T%v, msg %v",
+			[]interface{}{rf.me, rf.status, rf.currentTerm, msg})
+	}
+}

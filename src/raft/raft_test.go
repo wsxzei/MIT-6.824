@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"6.824/labgob"
 	"6.824/labrpc"
+	"bytes"
 	. "github.com/bytedance/mockey"
 	. "github.com/smartystreets/goconvey/convey"
 	"sync"
@@ -373,5 +375,228 @@ func TestPersistAndReadPersist(t *testing.T) {
 			So(rf2.votedFor, ShouldBeNil)
 			So(rf2.log, ShouldResemble, []*LogEntry{{}})
 		})
+	})
+}
+
+func TestCondInstallSnapshot(t *testing.T) {
+	PatchConvey("CondInstallSnapshot Test", t, func() {
+		persister := MakePersister()
+		rf := &Raft{
+			me:          0,
+			votedFor:    NewInt(0),
+			peers:       []*labrpc.ClientEnd{{}, {}, {}},
+			persister:   persister,
+			snapshotIdx: 6,
+			log: []*LogEntry{
+				{Term: 2},
+				{3, "A"}, // idx: 7
+				{3, "B"}, // idx: 8
+				{3, "C"}, // idx: 9
+				{4, "D"}, // idx: 10
+			},
+			currentTerm: 4,
+			lastApplied: 6,
+			commitIdx:   7,
+		}
+
+		PatchConvey("local log matches lastIncluded Term and Index", func() {
+			buffer := new(bytes.Buffer)
+			encoder := labgob.NewEncoder(buffer)
+			_ = encoder.Encode("B")
+			expectSnapshot := buffer.Bytes()
+			shouldApply := rf.CondInstallSnapshot(3, 8, expectSnapshot)
+
+			// check log entries and snapshotIdx
+			expectRaft := &Raft{
+				me:          0,
+				votedFor:    NewInt(0),
+				peers:       []*labrpc.ClientEnd{{}, {}, {}},
+				persister:   persister,
+				snapshotIdx: 8,
+				log: []*LogEntry{
+					{Term: 3},
+					{3, "C"}, // idx: 9
+					{4, "D"}, // idx: 10
+				},
+				currentTerm: 4,
+				lastApplied: 8,
+				commitIdx:   8,
+			}
+
+			So(rf.snapshotIdx, ShouldEqual, expectRaft.snapshotIdx)
+			So(rf.log, ShouldResemble, expectRaft.log)
+			So(rf.commitIdx, ShouldEqual, expectRaft.commitIdx)
+			So(rf.lastApplied, ShouldEqual, expectRaft.lastApplied)
+			So(shouldApply, ShouldEqual, true)
+
+			// decode byte array into structured object, check the persistence of raftState and snapshot
+			actualRaftState, actualSnapshot := persister.raftState, persister.snapshot
+			buffer2 := bytes.NewBuffer(actualRaftState)
+			decoder := labgob.NewDecoder(buffer2)
+
+			var (
+				currentTerm, votedFor, snapshotIdx int
+				logEntries                         []*LogEntry
+				actualCommand                      string
+			)
+			decoder.Decode(&currentTerm)
+			decoder.Decode(&votedFor)
+			decoder.Decode(&snapshotIdx)
+			decoder.Decode(&logEntries)
+			So(currentTerm, ShouldEqual, expectRaft.currentTerm)
+			So(votedFor, ShouldEqual, *expectRaft.votedFor)
+			So(snapshotIdx, ShouldEqual, expectRaft.snapshotIdx)
+			So(logEntries, ShouldResemble, expectRaft.log)
+
+			buffer2 = bytes.NewBuffer(actualSnapshot)
+			decoder = labgob.NewDecoder(buffer2)
+			decoder.Decode(&actualCommand)
+			So(actualCommand, ShouldEqual, "B")
+		})
+
+		PatchConvey("local log doesn't match lastIncluded Term and Index (1)", func() {
+			// local log doesn't match lastIncluded Term and Index because of the conflict of Term at the lastIncludedIndex
+			rf.currentTerm = 5
+			buffer := new(bytes.Buffer)
+			encoder := labgob.NewEncoder(buffer)
+			_ = encoder.Encode("F")
+			expectSnapshot := buffer.Bytes()
+			shouldApply := rf.CondInstallSnapshot(5, 8, expectSnapshot)
+
+			expectRaft := &Raft{
+				votedFor:    NewInt(0),
+				snapshotIdx: 8,
+				log: []*LogEntry{
+					{Term: 5},
+				},
+				currentTerm: 5,
+				lastApplied: 8,
+				commitIdx:   8,
+			}
+
+			So(rf.snapshotIdx, ShouldEqual, expectRaft.snapshotIdx)
+			So(rf.log, ShouldResemble, expectRaft.log)
+			So(rf.commitIdx, ShouldEqual, expectRaft.commitIdx)
+			So(rf.lastApplied, ShouldEqual, expectRaft.lastApplied)
+			So(shouldApply, ShouldEqual, true)
+
+			actualRaftState, actualSnapshot := persister.raftState, persister.snapshot
+			buffer2 := bytes.NewBuffer(actualRaftState)
+			decoder := labgob.NewDecoder(buffer2)
+
+			var (
+				currentTerm, votedFor, snapshotIdx int
+				logEntries                         []*LogEntry
+				actualCommand                      string
+			)
+			decoder.Decode(&currentTerm)
+			decoder.Decode(&votedFor)
+			decoder.Decode(&snapshotIdx)
+			decoder.Decode(&logEntries)
+			So(currentTerm, ShouldEqual, expectRaft.currentTerm)
+			So(votedFor, ShouldEqual, *expectRaft.votedFor)
+			So(snapshotIdx, ShouldEqual, expectRaft.snapshotIdx)
+			So(logEntries, ShouldResemble, expectRaft.log)
+
+			buffer2 = bytes.NewBuffer(actualSnapshot)
+			decoder = labgob.NewDecoder(buffer2)
+			decoder.Decode(&actualCommand)
+			So(actualCommand, ShouldEqual, "F")
+		})
+
+		PatchConvey("local log doesn't match lastIncluded Term and Index (2)", func() {
+			// local log doesn't match lastIncluded Term and Index because of len(rf.log) <= lastIncludedIndex
+			rf.currentTerm = 5
+			buffer := new(bytes.Buffer)
+			encoder := labgob.NewEncoder(buffer)
+			_ = encoder.Encode("G")
+			expectSnapshot := buffer.Bytes()
+			shouldApply := rf.CondInstallSnapshot(5, 12, expectSnapshot)
+
+			expectRaft := &Raft{
+				votedFor:    NewInt(0),
+				snapshotIdx: 12,
+				log: []*LogEntry{
+					{Term: 5},
+				},
+				currentTerm: 5,
+				lastApplied: 12,
+				commitIdx:   12,
+			}
+
+			So(rf.snapshotIdx, ShouldEqual, expectRaft.snapshotIdx)
+			So(rf.log, ShouldResemble, expectRaft.log)
+			So(rf.commitIdx, ShouldEqual, expectRaft.commitIdx)
+			So(rf.lastApplied, ShouldEqual, expectRaft.lastApplied)
+			So(shouldApply, ShouldEqual, true)
+		})
+	})
+}
+
+func TestInstallSnapshot(t *testing.T) {
+	PatchConvey("Test InstallSnapshot", t, func() {
+		persister := MakePersister()
+		rf := &Raft{
+			me:                  1,
+			persister:           persister,
+			currentTerm:         4,
+			log:                 []*LogEntry{{}},
+			status:              NodeStateEnum_Follower,
+			applyCh:             make(chan ApplyMsg),
+			resetSelectionTimer: NewBufferChan(make(chan int), make(chan int)),
+		}
+		go rf.resetSelectionTimer.Run()
+
+		PatchConvey("send snapshot", func() {
+			buff := new(bytes.Buffer)
+			encoder := labgob.NewEncoder(buff)
+			_ = encoder.Encode("E")
+			snapshot := buff.Bytes()
+
+			args := &InstallSnapshotArgs{
+				Term:      5,
+				LeaderId:  0,
+				LastIndex: 10,
+				LastTerm:  5,
+				Snapshot:  snapshot,
+			}
+			reply := &InstallSnapshotReply{}
+
+			rf.InstallSnapshot(args, reply)
+
+			So(rf.currentTerm, ShouldEqual, 5)
+			So(*rf.votedFor, ShouldEqual, 0)
+
+			time.Sleep(10 * time.Millisecond)
+
+			applyMsg := <-rf.applyCh
+			So(applyMsg, ShouldResemble, ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      snapshot,
+				SnapshotTerm:  5,
+				SnapshotIndex: 10,
+			})
+
+			eventTerm, ok := rf.resetSelectionTimer.Receive()
+			So(ok, ShouldEqual, true)
+			So(eventTerm, ShouldEqual, 4)
+
+			var (
+				currentTerm, votedFor, snapshotIdx int
+				logEntries                         []*LogEntry
+			)
+			actualRaftState := persister.raftState
+			buffer := bytes.NewBuffer(actualRaftState)
+			decoder := labgob.NewDecoder(buffer)
+			decoder.Decode(&currentTerm)
+			decoder.Decode(&votedFor)
+			decoder.Decode(&snapshotIdx)
+			decoder.Decode(&logEntries)
+			So(currentTerm, ShouldEqual, 5)
+			So(votedFor, ShouldEqual, 0)
+			So(snapshotIdx, ShouldEqual, 0)
+			So(logEntries, ShouldResemble, rf.log)
+		})
+
 	})
 }
