@@ -5,9 +5,9 @@ import (
 	"time"
 )
 
-// upToDate 比较 RPC 调用者的日志 与 当前节点日志哪个更新
-// 返回 true: (lastLogTerm, lastLogIndex) 不比 当前节点的日志旧
-// 必须在持有rf.mu时调用
+// upToDate compare the last entry's index and term of RequestVote RPC sender with
+// current Raft instance. If return true, (lastLogIndex, lastLogTerm) is uptodate.
+// note: rf.upToDate needs to be called with the protection of rf.mu
 func (rf *Raft) upToDate(lastLogIndex int, lastLogTerm int) bool {
 	var (
 		curLastLogIndex = rf.getGlobalIndex(len(rf.log) - 1)
@@ -26,42 +26,28 @@ func (rf *Raft) upToDate(lastLogIndex int, lastLogTerm int) bool {
 	return lastLogIndex >= curLastLogIndex
 }
 
-// logSyncer Leader 同步日志条目到指定 Follower
-//  1. 每隔 15ms, 检查最新的日志条目是否发生了变化:
-//     1.1 若发生了变化, 发起 AppendEntries RPC, 同步条目给 Follower
-//     1.2 若没有发生变化, no-ops
-//  2. 上一次 AppendEntries 到当前时间超过 150ms, 发起心跳
+// logSyncer Leader synchronize log entries to specific Follower
+//  1. Every once in a while (I choose 20~30ms), determine whether there is some new log entries.
+//     1.1 if yes, send AppendEntries RPC to Follower.
+//     1.2 if no, just increment no-ops count.
+//  2. If no-ops count is equal to -1 or 4, which means current Raft instance just become leader
+//     or a heartbeat period is elapsed, send heartbeat.
 //
-// 注: 若 raft 被 killed 或 任期发生变化, 退出 Goroutine
+// note: if raft instance is killed or currentTerm has changed, exit logSyncer Goroutine.
 func (rf *Raft) logSyncer(server int, expectTerm int) {
+	noOpsCnt := -1
 
-	noOpsCnt := -1 // Leader 当选后立即发起一轮 AppendEntries RPC 作为心跳
-
-	//tPrevEndLoop := time.Now().UnixMilli()
-	for {
-		//tBeginLoop := time.Now().UnixMilli()
-
-		if rf.killed() {
-			return
-		}
-		//tKill := time.Now().UnixMilli()
-
-		rf.mu.Lock()
-
-		//tLock := time.Now().UnixMilli()
-		//DPrintf(dTest, LogCommonFormat+", logSyncer-> S%v, noOpsCnt %v, a new loop spend %v ms, rf.killed spend %v ms, acquire Lock spend %v ms,",
-		//	[]interface{}{rf.me, rf.status.String(), rf.currentTerm, server, noOpsCnt,
-		//		tBeginLoop - tPrevEndLoop, tKill - tBeginLoop, tLock - tKill})
+	for !rf.killed() {
+		rf.Lock("[rf.logSyncer] begin a new for-loop")
 
 		if rf.currentTerm != expectTerm {
-			rf.mu.Unlock()
+			rf.Unlock("[rf.logSyncer] rf.currentTerm changed, exit logSyncer")
 			return
 		}
 
 		curLastLogIndex := rf.getGlobalIndex(len(rf.log) - 1)
 
 		if curLastLogIndex >= rf.nextIdx[server] || (noOpsCnt+1)%5 == 0 {
-			// 日志发生变化 或 超出心跳周期, AppendEntries RPC 同步日志给 Follower
 			DPrintf(dLog, LogCommonFormat+", logSyncer-> S%v, index %v vs %v, noOpsCnt %v",
 				[]interface{}{rf.me, rf.status.String(), rf.currentTerm, server, curLastLogIndex, rf.nextIdx[server], noOpsCnt})
 			rf.syncEntriesToFollower(server, expectTerm)
@@ -69,27 +55,49 @@ func (rf *Raft) logSyncer(server int, expectTerm int) {
 		} else {
 			noOpsCnt++
 		}
-		rf.mu.Unlock()
+		rf.Unlock("[rf.logSyncer] before Goroutine Sleep")
 
 		randSleepTime := GetRandom(int(HeartbeatPeriod/5-10*time.Millisecond), int(HeartbeatPeriod/5)) // 20ms~30ms
 		time.Sleep(time.Duration(randSleepTime))
-
-		//tPrevEndLoop = time.Now().UnixMilli()
 	}
 }
 
-// syncEntriesToFollower 使用 AppendEntries 同步日志
-// 注: sendAppendEntries 失败, 直接返回. logSyncer 中会以 15ms 为间隔重试
+// syncEntriesToFollower send multiple rounds of AppendEntries RPC to synchronize log to Follower
 func (rf *Raft) syncEntriesToFollower(server int, expectTerm int) {
 
 	for !rf.killed() && rf.currentTerm == expectTerm {
 
 		lastLogIdx := rf.getGlobalIndex(len(rf.log) - 1)
 		prevLogIdx := rf.nextIdx[server] - 1
+
+		// if prevLogIndex is less than rf.snapshotIdx, send InstallSnapshot RPC
+		if prevLogIdx < rf.snapshotIdx {
+			if retry := rf.syncBySnapshot(server); retry {
+				// send rpc timeout, immediately retry
+				continue
+			}
+			return
+		}
+
 		prevLogTerm := rf.log[rf.getLocalIndex(prevLogIdx)].Term
 		entries := make([]*LogEntry, lastLogIdx-prevLogIdx)
-		if len(entries) > 0 {
-			copy(entries, rf.log[rf.getLocalIndex(prevLogIdx)+1:])
+		// notes: The following copy method will cause bugs,
+		// because I expose the reference of LogEntry object without the protection of rf.mu
+		// and in method rf.deleteTo, I will initialize dummy Command to nil.
+		// There are two solutions:
+		// 1. deep copy LogEntry Object
+		// 2. Once generate LogEntry Object, don't modify the fields in it
+		//
+		//if len(entries) > 0 {
+		//	copy(entries, rf.log[rf.getLocalIndex(prevLogIdx)+1:])
+		//}
+		j := 0
+		for i := rf.getLocalIndex(prevLogIdx) + 1; i < len(rf.log); i++ {
+			entries[j] = &LogEntry{
+				Term:    rf.log[i].Term,
+				Command: rf.log[i].Command,
+			}
+			j++
 		}
 
 		args := &AppendEntriesArgs{
@@ -102,7 +110,7 @@ func (rf *Raft) syncEntriesToFollower(server int, expectTerm int) {
 		}
 		reply := &AppendEntriesReply{}
 
-		rf.mu.Unlock()
+		rf.Unlock("[rf.syncEntriesToFollower] before select")
 
 		argStr, _ := sonic.MarshalString(args)
 		DPrintf(dLog, LogCommonFormat+"->S%v, sendAppendEntries Args=%v", []interface{}{rf.me, NodeStateEnum_Leader, expectTerm, server, argStr})
@@ -117,35 +125,33 @@ func (rf *Raft) syncEntriesToFollower(server int, expectTerm int) {
 
 		select {
 		case <-timeout:
-			DPrintf(dError, LogCommonFormat+"->S%v, [sendAppendEntries] timeout, retry", []interface{}{rf.me, NodeStateEnum_Leader, expectTerm, server})
-			rf.mu.Lock()
-			// 超时后立即重试
+			DPrintf(dError, LogCommonFormat+" ->S%v, sendAppendEntries timeout, retry", []interface{}{rf.me, NodeStateEnum_Leader, expectTerm, server})
+			rf.Lock("[rf.syncEntriesToFollower] rf.sendAppendEntries timeout")
+			// Once rpc timeout, retry immediately
 			continue
 		case ok := <-complete:
+			rf.Lock("[rf.syncEntriesToFollower] rf.sendAppendEntries complete")
 			if !ok {
-				// send rpc 报错, 返回
 				DPrintf(dError, LogCommonFormat+" ->S%v, sendAppendEntries failed", []interface{}{rf.me, NodeStateEnum_Leader, expectTerm, server})
-				rf.mu.Lock()
 				return
 			}
 		}
 
 		replyStr, _ := sonic.MarshalString(reply)
 		DPrintf(dLog, LogCommonFormat+" ->S%v, sendAppendEntries reply=%v", []interface{}{rf.me, NodeStateEnum_Leader, expectTerm, server, replyStr})
-		rf.mu.Lock()
 		if rf.currentTerm < reply.Term {
-			// 当前节点为过去任期, 切换为 Follower, 更新任期
+			// currentTerm is less than receiver, switch to follower and update currentTerm
 			rf.follower(reply.Term, nil)
 			return
 		}
 
 		if args.Term != rf.currentTerm {
-			// 当前任期不等于发出请求时的任期, 不处理响应结果
+			// currentTerm isn't equal to the term when raft send RPC, don't handle reply
 			return
 		}
 
 		if reply.Success {
-			// 更新nextIdx, matchIdx
+			// Once Follower passes consistency check, update Leader's nextIndex and matchIndex
 			rf.nextIdx[server] = args.PrevLogIdx + len(args.Entries) + 1
 			rf.matchIdx[server] = args.PrevLogIdx + len(args.Entries)
 			DPrintf(dLog, LogCommonFormat+" ->S%v, syncEntriesToFollower Success=true, (matchIdx, nextIdx)=(%v, %v)",
@@ -153,10 +159,73 @@ func (rf *Raft) syncEntriesToFollower(server int, expectTerm int) {
 			return
 		}
 
-		// 更新 nextIdx 数组, 用于新一轮的 AppendEntries
+		// If this round of AppendEntries RPC failed, decrement nextIndex and retry
 		rf.nextIdx[server] = rf.calcNextIdx(reply.ConflictIdx, reply.ConflictTerm)
-		DPrintf(dLog, LogCommonFormat+"->S%v, syncEntriesToFollower Success=false, nextIdx=%v", []interface{}{rf.me, NodeStateEnum_Leader, expectTerm, server, rf.nextIdx[server]})
+		DPrintf(dLog, LogCommonFormat+" ->S%v, syncEntriesToFollower Success=false, nextIdx=%v", []interface{}{rf.me, NodeStateEnum_Leader, expectTerm, server, rf.nextIdx[server]})
 	}
+	return
+}
+
+func (rf *Raft) syncBySnapshot(server int) (retry bool) {
+	snapshot := rf.persister.snapshot
+
+	args := &InstallSnapshotArgs{
+		Term:      rf.currentTerm,
+		LeaderId:  rf.me,
+		LastIndex: rf.snapshotIdx,
+		LastTerm:  rf.log[0].Term,
+		Snapshot:  snapshot,
+	}
+	reply := &InstallSnapshotReply{}
+
+	rf.Unlock("[rf.syncBySnapshot] before select")
+
+	argStr, _ := sonic.MarshalString(args)
+	DPrintf(dSnap, LogCommonFormat+" ->S%v, InstallSnapshotArgs = %v",
+		[]interface{}{rf.me, rf.status, rf.currentTerm, server, argStr})
+
+	timeout, complete := make(chan struct{}, 1), make(chan bool, 1)
+	go startTimer(timeout, TimeScene_RPC)
+
+	go func() {
+		ok := rf.sendInstallSnapshot(server, args, reply)
+		complete <- ok
+	}()
+
+	select {
+	case <-timeout:
+		rf.Lock("[rf.syncBySnapshot] sendInstallSnapshot timeout")
+		DPrintf(dSnap, LogCommonFormat+" ->S%v, sendInstallSnapshot timeout", []interface{}{rf.me, rf.status, rf.currentTerm, server})
+		retry = true
+		return
+	case ok := <-complete:
+		rf.Lock("[rf.syncBySnapshot] sendInstallSnapshot complete")
+		if !ok {
+			DPrintf(dSnap, LogCommonFormat+" ->S%v, sendInstallSnapshot failed", []interface{}{rf.me, rf.status, rf.currentTerm, server})
+			return
+		}
+	}
+
+	DPrintf(dSnap, LogCommonFormat+" ->S%v, sendInstallSnapshot reply.Term %v", []interface{}{rf.me, rf.status, rf.currentTerm, server, reply.Term})
+	if rf.currentTerm < reply.Term {
+		rf.follower(reply.Term, nil)
+		return
+	}
+
+	if rf.currentTerm != args.Term {
+		return
+	}
+
+	// Leader receives the reply of InstallSnapshot RPC, which doesn't mean that
+	// the Followers has installed snapshot.
+	// But it doesn't matter to update (nextIdx, matchIdx) --> (LastIndex + 1, LastIndex).
+	// Even if the installing snapshot fails, the updating of nextIdx will result in at most one redundant AppendEntries RPC,
+	// and the updating of matchIdx won't affect the commit of the log entries after index LastIndex.
+	// note: don't use rf.getGlobalIndex, rf.snapshotIdx may be updated by rf.Snapshot
+	rf.nextIdx[server] = args.LastIndex + 1
+	rf.matchIdx[server] = args.LastIndex
+	DPrintf(dSnap, LogCommonFormat+" ->S%v, syncBySnapshot update (matchIdx, nextIdx)->(%v, %v)",
+		[]interface{}{rf.me, rf.status, rf.currentTerm, server, rf.matchIdx[server], rf.nextIdx[server]})
 	return
 }
 
@@ -187,9 +256,14 @@ func (rf *Raft) calcNextIdx(conflictIdx int, conflictTerm *int) int {
 		return conflictIdx + 1
 	}
 
-	// 寻找 Leader 中最后一个任期 conflictTerm 的日志条目
-	nextIdx := conflictIdx
-	for i := conflictIdx; i < rf.getGlobalIndex(len(rf.log)); i++ {
+	// find the last log entry whose term is conflictTerm in Leader's log
+	// if conflictIdx isn't contained in the log but in the snapshot,
+	// set nextIdx to snapshotIndex,
+	// so that if the entry term for index snapshotIndex is not equal to conflictTerm,
+	// an InstallSnapshot RPC will be sent
+	nextIdx := MaxInt(conflictIdx, rf.snapshotIdx)
+
+	for i := nextIdx; i < rf.getGlobalIndex(len(rf.log)); i++ {
 		if rf.log[rf.getLocalIndex(i)].Term == *conflictTerm {
 			nextIdx++
 		} else {
@@ -201,18 +275,19 @@ func (rf *Raft) calcNextIdx(conflictIdx int, conflictTerm *int) int {
 }
 
 func (rf *Raft) applier() {
-	rf.mu.Lock()
+	rf.Lock("[rf.applier] start applier Goroutine")
 
 	for {
 		if rf.killed() {
-			rf.mu.Unlock()
+			rf.Unlock("[rf.applier] rf is killed, applier exit")
 			return
 		}
 
 		applyMsgs := make([]ApplyMsg, 0)
+		// rf.lastApplied must greater than or equal to rf.snapshotIdx
 		for globalIdx := rf.lastApplied + 1; globalIdx <= rf.commitIdx; globalIdx++ {
 			localIdx := rf.getLocalIndex(globalIdx)
-			entry := rf.log[localIdx] // 数组越界了, 排查 rf.commitIdx、rf.log 更新
+			entry := rf.log[localIdx]
 			applyMsgs = append(applyMsgs, ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
@@ -221,23 +296,23 @@ func (rf *Raft) applier() {
 		}
 
 		if len(applyMsgs) == 0 {
-			// 等待新的日志提交
-			rf.logCommit.Wait()
+			// wait for some new log entries committed
+			rf.logCommitWait("[rf.applier] applyMsgs is empty")
 		} else {
 			msgs, _ := sonic.MarshalString(applyMsgs)
 			DPrintf(dApply, LogCommonFormat+", lastApplied %v->%v, applyMsgs: %v",
 				[]interface{}{rf.me, rf.status, rf.currentTerm, rf.lastApplied, rf.lastApplied + len(applyMsgs), msgs})
 			rf.lastApplied += len(applyMsgs)
-			rf.mu.Unlock()
+			rf.Unlock("[rf.applier] begin sending applyMsgs")
 			for _, msg := range applyMsgs {
 				rf.applyCh <- msg
 			}
-			rf.mu.Lock()
+			rf.Lock("[rf.applier] complete sending applyMsgs")
 		}
 	}
 }
 
-// 获取全局索引, 即 snapshot offset + localIndex
+// GlobalIndex: snapshot offset + localIndex
 func (rf *Raft) getGlobalIndex(localIndex int) int {
 	return rf.snapshotIdx + localIndex
 }
@@ -246,9 +321,9 @@ func (rf *Raft) getLocalIndex(globalIndex int) int {
 	return globalIndex - rf.snapshotIdx
 }
 
-// 二分查找, 找到 index 满足如下条件:
-// 条件1. 超过 (rf.peers)/2 的成员的 rf.matchIdx >= index
-// 条件2. 不存在比 index 大的索引满足条件 1
+// maxIndexForCommit binary search the 'index' which demands the following conditions:
+// Condition 1: a majority of cluster peers' matchIndex are more than 'index'
+// Condition 2: There is no index lager than  'index' which demands Condition 1.
 func (rf *Raft) maxIndexForCommit() int {
 
 	left := rf.commitIdx
@@ -279,4 +354,23 @@ func (rf *Raft) deleteEntryFrom(conflictIdx int) {
 	entries := make([]*LogEntry, conflictIdx)
 	copy(entries, rf.log[:conflictIdx]) // for gc
 	rf.log = entries
+}
+
+// delete local log entries to index (including)
+func (rf *Raft) deleteTo(index int) {
+	before, _ := sonic.MarshalString(rf.log)
+	lastEntryIndex := rf.getGlobalIndex(len(rf.log) - 1)
+	if index > lastEntryIndex {
+		index = lastEntryIndex
+	}
+
+	newSize := lastEntryIndex - index + 1 // include dummy Entry
+	entries := make([]*LogEntry, newSize)
+	copy(entries, rf.log[rf.getLocalIndex(index):])
+	entries[0].Command = nil // just maintain snapshotTerm in the dummy entry
+
+	rf.log = entries
+	after, _ := sonic.MarshalString(rf.log)
+	DPrintf(dLog, LogCommonFormat+" snapshotIdx %v, rf.deleteTo(I%v), log: %v\n--> %v",
+		[]interface{}{rf.me, rf.status, rf.currentTerm, rf.snapshotIdx, index, before, after})
 }
