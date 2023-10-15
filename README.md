@@ -78,3 +78,7 @@ Lab 2B test result: run 6,000 tests with no failures
 ## Lab: 2C
 Lab 2C test result: run 6,000 tests with no failures
 ![Lab 2C](https://raw.githubusercontent.com/wsxzei/markdown-photos/main/mit-6.824/lab%202C%20test%20result.png)
+
+## Lab: 2D
+Lab 2D test result: run 6,000 tests with no failures
+![Lab 2D](https://raw.githubusercontent.com/wsxzei/markdown-photos/main/mit-6.824/lab%202A%202B%202C%202D%20test%20result.png)
